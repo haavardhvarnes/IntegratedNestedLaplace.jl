@@ -1,0 +1,17 @@
+# Julia artifacts
+Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+
+# IDEs
+.vscode/
+.idea/
+
+# OS artifacts
+.DS_Store
+
+# Temporary benchmark artifacts
+swiss_rainfall_mode.png
+tutorial_*.jl
+test_*.jl
