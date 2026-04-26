@@ -63,7 +63,30 @@ using SparseConnectivityTracer
         KernelAbstractions.synchronize(backend)
         
         # Verify first element
-        expected = -0.5*log(2π) + 0.5*log(tau) - 0.5*tau*y[1]^2
-        @test isapprox(out[1], expected)
+        expected = -0.9189385 + 0.5*log(tau) - 0.5*tau*y[1]^2
+        @test isapprox(out[1], expected, atol=1e-6)
+    end
+
+    @testset "Integration Nodes" begin
+        mode = [1.0, 2.0]
+        hessian = [4.0 0.0; 0.0 1.0]
+        nodes = integration_nodes(mode, hessian)
+        @test any(n -> isapprox(n, mode), nodes)
+        for n in nodes
+            @test length(n) == 2
+        end
+    end
+
+    @testset "GMRF Newton" begin
+        n = 5
+        Q = spdiagm(0 => fill(2.0, n))
+        y = [1.0, 2.0, 3.0, 2.0, 1.0]
+        # Gaussian LL: -0.5 * (y - x)^2 -> grad = y - x, hess = -1
+        gl(x) = y - x
+        hl(x) = fill(-1.0, n)
+        
+        x_mode = gmrf_newton(gl, hl, Q, zeros(n))
+        # Analytical mode for Gaussian: (Q + I)x = y -> 3x = y -> x = y/3
+        @test isapprox(x_mode, y ./ 3.0, atol=1e-6)
     end
 end

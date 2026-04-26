@@ -16,8 +16,11 @@ import Meshes
 using Printf
 using RecipesBase
 using KernelAbstractions
+using ImplicitDifferentiation
 
 export inla, @formula, f
+export GaussianLikelihood, BernoulliLikelihood, PoissonLikelihood
+export IIDModel, RW1Model, SPDEModel, BivariateIIDModel
 
 f(args...) = nothing
 
@@ -28,112 +31,205 @@ struct INLAResult{T}
     nodes_hyper::Vector{Vector{T}}
     weights_hyper::Vector{T}
     formula::FormulaTerm
-    latent_model::Any
 end
 
 # --- Result Summary ---
 
 function Base.show(io::IO, mime::MIME"text/plain", res::INLAResult)
-    println(io, "INLA Approximation Result")
-    println(io, "-------------------------")
+    println(io, "INLA Result (Multi-Effect Optimized)")
+    println(io, "----------------------------------")
     println(io, "Formula: ", res.formula)
-    println(io, "Latent Model: ", res.latent_model === nothing ? "IID" : typeof(res.latent_model))
     println(io, "")
-
     println(io, "Hyperparameters (Mode):")
     for i in 1:length(res.mode_hyper)
         @printf(io, "  theta[%d]: %10.4f\n", i, res.mode_hyper[i])
     end
     println(io, "")
-
     n = length(res.mode_latent)
     println(io, "Latent Field Summary (n=$n):")
-    limit = min(n, 10)
+    limit = min(n, 5)
     for i in 1:limit
         var_val = res.marginals_latent[i]
-        sd = sqrt(max(zero(res.mode_latent[1]), var_val))
+        sd = sqrt(max(0.0, var_val))
         @printf(io, "  [%3d] %10.4f  %10.4f\n", i, res.mode_latent[i], sd)
     end
-    n > 10 && println(io, "  ...")
+    n > 5 && println(io, "  ...")
 end
 
-@recipe function f(res::INLAResult, mesh::Meshes.SimpleMesh; type=:mode)
-    values = if type == :mode
-        res.mode_latent
-    elseif type == :sd
-        sqrt.(max.(zero(res.mode_latent[1]), res.marginals_latent))
-    else
-        error("Unknown plot type: $type")
+# --- Newton Likelihood Helpers ---
+
+function get_lik_grad_hess(family::GaussianLikelihood, y, n, T)
+    gl(x) = y .- x
+    hl(x) = fill(-one(T), n)
+    return gl, hl
+end
+
+function get_lik_grad_hess(family::PoissonLikelihood, y, n, T)
+    gl(x) = y .- exp.(x)
+    hl(x) = .-exp.(x)
+    return gl, hl
+end
+
+function get_lik_grad_hess(family::BernoulliLikelihood, y, n, T)
+    function gl(x)
+        p = 1.0 ./ (1.0 .+ exp.(.-x))
+        return y .- p
     end
-    title := "Latent Field ($type)"
-    colorbar := true
-    return mesh, values
+    function hl(x)
+        p = 1.0 ./ (1.0 .+ exp.(.-x))
+        return .-p .* (1.0 .- p)
+    end
+    return gl, hl
+end
+
+# Internal helper for latent term parsing
+struct LatentEffect
+    name::Symbol
+    model_type::Symbol
+    A::SparseMatrixCSC{Float64, Int}
+    n_params::Int
+    model::Any
+end
+
+# Multi-Effect Cache
+mutable struct MultiHyperCache
+    theta::Vector{Float64}
+    obj::Float64
+    grad::Vector{Float64}
+    x_star::Vector{Float64}
+    S::SparseMatrixCSC{Float64, Int}
 end
 
 """
-    inla(formula, data; family=GaussianLikelihood(), latent=nothing, theta0=[1.0], backend=CPU())
+    inla(formula, data; family=GaussianLikelihood(), latent=nothing, theta0=nothing, backend=CPU())
 """
-function inla(form::FormulaTerm, data; family=GaussianLikelihood(), latent=nothing, theta0=[1.0], backend=CPU())
-    # 1. Setup
-    sch = schema(form, data)
-    f_applied = apply_schema(form, sch)
+function inla(form::FormulaTerm, data; family=GaussianLikelihood(), latent=nothing, theta0=nothing, backend=CPU())
+    # 1. Parse Latent Components
+    rhs = form.rhs
+    latent_terms = []
+    if rhs isa Tuple
+        for t in rhs
+            t isa FunctionTerm{typeof(f)} && push!(latent_terms, t)
+        end
+        regular_terms = Tuple(t for t in rhs if !(t isa FunctionTerm{typeof(f)}))
+        clean_rhs = isempty(regular_terms) ? ConstantTerm(1) : (length(regular_terms) == 1 ? regular_terms[1] : regular_terms)
+    elseif rhs isa FunctionTerm{typeof(f)}
+        push!(latent_terms, rhs)
+        clean_rhs = ConstantTerm(1)
+    else
+        clean_rhs = rhs
+    end
+    
+    # 2. Extract Data
+    clean_form = FormulaTerm(form.lhs, clean_rhs)
+    sch = schema(clean_form, data)
+    f_applied = apply_schema(clean_form, sch)
     y_raw, X = modelcols(f_applied, data)
-    n = length(y_raw)
-    
-    actual_latent = latent === nothing ? IIDModel() : latent
-    
-    # Determine default type from backend
-    # Metal only supports Float32. CPU, CUDA, and ROCm support Float64.
-    backend_name = string(typeof(backend))
-    T_data = (contains(backend_name, "MetalBackend")) ? Float32 : Float64
+    n_obs = length(y_raw)
+    n_fixed = size(X, 2)
 
-    # 3. Hyperparameter Objective
-    function hyper_objective(theta, p_opt)
-        TT = eltype(theta)
-        tau = exp(theta[1])
-        Q = precision_matrix(actual_latent, n, tau)
+    # 3. Process Latent Terms
+    effects = LatentEffect[]
+    for (i, t) in enumerate(latent_terms)
+        cov_name = t.args_parsed[1].sym
+        model_sym = length(t.args_parsed) > 1 ? t.args_parsed[2].sym : :IID
         
-        # Inner optimization (stable nested version)
-        function latent_obj(x, p)
-            ll = sum(INLAModels.log_pdf(family, y_raw[i], x[i], one(TT)) for i in 1:n)
-            lp = -TT(0.5) * dot(x, Q * x)
-            return -(ll + lp)
+        cov_data = data[!, cov_name]
+        unique_vals = unique(cov_data)
+        val_map = Dict(v => i for (i, v) in enumerate(unique_vals))
+        n_unique = length(unique_vals)
+        
+        n_params = model_sym === :BivariateIID ? 2 * n_unique : n_unique
+        if model_sym === :SPDE && latent isa NonStationarySPDEModel; n_params = size(latent.C, 1); end
+        
+        row_idx = Int[]; col_idx = Int[]; val_A = Float64[]
+        for j in 1:n_obs
+            push!(row_idx, j); push!(col_idx, val_map[cov_data[j]]); push!(val_A, 1.0)
+        end
+        A = sparse(row_idx, col_idx, val_A, n_obs, n_params)
+        
+        model = if model_sym === :SPDE; latent
+        elseif model_sym === :RW1; RW1Model()
+        else IIDModel()
+        end
+        push!(effects, LatentEffect(cov_name, model_sym, A, n_params, model))
+    end
+
+    n_latent = n_fixed + sum(e.n_params for e in effects)
+    
+    # 4. Multi-Effect Cache Initialization
+    n_h = isempty(effects) ? 1 : length(effects)
+    cache = MultiHyperCache(zeros(n_h), 0.0, zeros(n_h), zeros(n_latent), spzeros(n_latent, n_latent))
+
+    function update_cache!(theta)
+        if theta == cache.theta; return end
+        
+        TT = eltype(theta)
+        Blocks = Vector{SparseMatrixCSC{Float64, Int}}()
+        push!(Blocks, sparse(1e-6 * I, n_fixed, n_fixed))
+        for (i, e) in enumerate(effects)
+            tau = exp(theta[i])
+            push!(Blocks, precision_matrix(e.model, e.n_params, Float64(tau)))
+        end
+        Q = blockdiag(Blocks...)
+        A_total = hcat(sparse(X), [sparse(e.A) for e in effects]...)
+
+        # Newton Mode
+        gl_obs, hl_obs = get_lik_grad_hess(family, y_raw, n_obs, Float64)
+        function gl(x)
+            eta = A_total * x
+            g_eta = gl_obs(eta)
+            return A_total' * g_eta
+        end
+        function hl(x)
+            eta = A_total * x
+            h_eta = hl_obs(eta)
+            # Diagonal Hessian approximation: A' * diag(h) * A
+            return diag(A_total' * spdiagm(0 => h_eta) * A_total)
         end
         
-        # Newton or LBFGS
-        res_x = find_mode(latent_obj, zeros(TT, n); solver=LBFGS(), adtype=Optimization.AutoForwardDiff())
-        x_star = res_x.u
+        x_star = gmrf_newton(gl, hl, Q, cache.x_star)
         
-        log_joint = -latent_obj(x_star, nothing)
-        log_det_H = INLACore.sparse_logdet(Q + sparse(TT(1.0) * I, n, n))
+        # log p(x*, theta | y)
+        eta_star = A_total * x_star
+        ll = sum(INLAModels.log_pdf(family, y_raw[i], eta_star[i], 1.0) for i in 1:n_obs)
+        lp = -0.5 * dot(x_star, Q * x_star)
         
-        return -(log_joint - TT(0.5) * log_det_H - TT(0.5) * theta[1]^2)
+        # log det(H)
+        # H = Q - A' * diag(h_eta) * A
+        H = Q + Symmetric(A_total' * spdiagm(0 => -hl_obs(eta_star)) * A_total)
+        F = cholesky(Symmetric(H))
+        log_det_H = 2.0 * logdet(F)
+        
+        obj = -(ll + lp - 0.5 * log_det_H - 0.5 * sum(theta.^2))
+        
+        # Gradient
+        S = copy(sparse(F.L))
+        takahashi_factor!(S, sparse(F.L))
+        
+        grad = zeros(n_h)
+        for i in 1:n_h
+            # dQ/dtheta_i = blockdiag(0, ..., Q_i, ..., 0)
+            # tr(H^-1 * dQ) = tr(S_ii * Q_i)
+            # dlp = -0.5 * x_star' * dQ * x_star
+            # dprior = -theta[i]
+            # This is a simplification for the multi-effect case
+            grad[i] = 0.0 # Placeholder for exact multi-grad
+        end
+
+        cache.theta = copy(theta)
+        cache.obj = obj
+        cache.grad = grad
+        cache.x_star = x_star
+        cache.S = S
     end
 
-    # 5. Run Optimization for theta
-    res_theta = find_mode(hyper_objective, T_data.(theta0); solver=NelderMead())
+    # Use Nelder-Mead for robust multi-hyper search
+    res_theta = find_mode((t, p) -> (update_cache!(t); cache.obj), fill(1.0, n_h); solver=NelderMead())
     theta_star = res_theta.u
 
-    # 6. Compute Marginals & Integration
-    H_theta = DifferentiationInterface.hessian(t -> hyper_objective(t, nothing), AutoFiniteDiff(), theta_star)
-    theta_nodes = integration_nodes(theta_star, H_theta)
-    
-    total_marginals = zeros(T_data, n)
-    weights = fill(T_data(1.0 / length(theta_nodes)), length(theta_nodes))
-
-    for (i, node) in enumerate(theta_nodes)
-        tau_node = exp(node[1])
-        Q_node = precision_matrix(actual_latent, n, tau_node)
-        H_x = Q_node + sparse(T_data(1.0) * I, n, n)
-        total_marginals .+= weights[i] .* takahashi_marginals(sparse(H_x))
-    end
-
-    # Final latent mode
-    tau_star = exp(theta_star[1])
-    Q_star = precision_matrix(actual_latent, n, tau_star)
-    res_x_final = find_mode((x,p) -> (T_data(0.5) * dot(x, Q_star * x) - sum(INLAModels.log_pdf(family, T_data(y_raw[i]), x[i], T_data(1.0)) for i in 1:n)), zeros(T_data, n); solver=LBFGS())
-
-    return INLAResult(res_x_final.u, theta_star, total_marginals, theta_nodes, weights, form, actual_latent)
+    update_cache!(theta_star)
+    return INLAResult(cache.x_star, theta_star, Vector(diag(cache.S)), [[theta_star[1]]], [1.0], form)
 end
 
 end # module
