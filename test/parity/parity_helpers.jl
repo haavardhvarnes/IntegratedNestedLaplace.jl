@@ -38,10 +38,11 @@ hyper_sd(ref, name)   = ref["hyper"][name]["sd"]
 Assert agreement of a fixed-effect summary against R-INLA. The mean tolerance is
 `max(mean_floor, mean_atol_factor × R-INLA SD)`. SD tolerance is relative.
 
-Phase 1 default is 10 % of R-INLA SD for the mean: Julia returns the joint mode
-at θ*, while R-INLA reports the marginal posterior mean integrated over θ. They
-differ by O(0.1 × SD) on typical Gaussian-like posteriors. Phase 2 (CCD
-integration) will tighten this back to ~1 % of SD.
+Phase 2 default (after CCD integration over θ) is 10 % of R-INLA SD. CCD covers
+the integration over θ, but the Gaussian Laplace approximation of `π(x|y,θ)`
+still underestimates the marginal posterior mean for skewed likelihoods like
+Bernoulli (typically by O(0.1 × SD) on a single coordinate). The simplified-
+Laplace skewness correction lands in Phase 3 and tightens this to ~1 % of SD.
 """
 function assert_fixed(ref, term, julia_mean, julia_sd;
                       mean_atol_factor = 0.10,
@@ -55,17 +56,16 @@ function assert_fixed(ref, term, julia_mean, julia_sd;
 end
 
 """
-    assert_log_precision(ref, name, julia_log_tau; atol=0.15)
+    assert_precision_mean(ref, name, julia_tau_mean; rtol=0.10)
 
-Compare R-INLA's posterior mean precision (on the log scale) against a Julia
-log-precision *mode*. Default Phase 1 tolerance is 0.15 on the log-precision
-scale (≈15 % on the precision scale) to account for the systematic
-mode-vs-mean offset of the log-Gamma posterior. Tightens to ~0.05 once CCD
-integration lands.
+Compare R-INLA's posterior precision mean against the Julia CCD-mixture mean
+of `exp(θ_i)`. Default tolerance is 10 % on the precision scale (the prior
+on log-precision is heavy-tailed, so even with CCD the agreement is looser
+than for fixed effects).
 """
-function assert_log_precision(ref, name, julia_log_tau; atol = 0.15)
+function assert_precision_mean(ref, name, julia_tau_mean; rtol = 0.10)
     rmean = hyper_mean(ref, name)
-    @test isapprox(julia_log_tau, log(rmean); atol = atol)
+    @test isapprox(julia_tau_mean, rmean; rtol = rtol)
 end
 
 """

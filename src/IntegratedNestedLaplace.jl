@@ -14,8 +14,10 @@ using Printf
 using KernelAbstractions
 
 export inla, @formula, f
+export INLAResult, hyper_precision_mean
 export GaussianLikelihood, BernoulliLikelihood, PoissonLikelihood
 export IIDModel, RW1Model, SPDEModel, BivariateIIDModel, ICARModel, NonStationarySPDEModel
+export BesagModel
 
 # `f(...)` is purely a marker for the formula DSL; StatsModels parses the call
 # expression for us via `args_parsed`. Calling it directly is meaningless.
@@ -24,14 +26,59 @@ f(args...) = nothing
 # R-INLA's default fixed-effect prior: N(0, 1000²) ⇒ precision 0.001.
 const DEFAULT_FIXED_PRECISION = 1.0e-3
 
+"""
+    INLAResult
+
+The output of [`inla`](@ref).
+
+Fields:
+* `mode_latent`      — joint posterior mode of the latent field at θ*.
+* `mean_latent`      — posterior mean of the latent field, integrated over θ
+                       via CCD when there are ≥ 1 hyperparameters; otherwise
+                       equal to `mode_latent`.
+* `mode_hyper`       — θ* on the unconstrained scale.
+* `mean_hyper`       — posterior mean of θ from the CCD mixture (or `mode_hyper`
+                       if no integration was done).
+* `marginals_latent` — per-coordinate posterior variance of the latent field
+                       (mixture variance after CCD).
+* `marginals_hyper`  — `n_hyper × 2` matrix `[θ_mean θ_sd]` from the CCD
+                       mixture (or empty if `n_hyper == 0`).
+* `nodes_hyper`      — vector of θ values used for CCD integration; each entry
+                       is a length-`n_hyper` vector.
+* `weights_hyper`    — normalised mixture weights matching `nodes_hyper`.
+* `formula`          — the original `FormulaTerm` passed to `inla`.
+
+Comparison to R-INLA: `summary.fixed\$mean` corresponds to `mean_latent[1:n_fixed]`,
+not `mode_latent`. `summary.hyperpar\$mean` (on the precision scale) corresponds
+to a mixture average of `exp(θ)` rather than `exp(mean_hyper)` — see the
+`hyper_precision_mean` helper.
+"""
 struct INLAResult{T}
     mode_latent::Vector{T}
+    mean_latent::Vector{T}
     mode_hyper::Vector{T}
+    mean_hyper::Vector{T}
     marginals_latent::Vector{T}
     marginals_hyper::Matrix{T}            # one row per hyperparameter, columns = (mean, sd)
     nodes_hyper::Vector{Vector{T}}
     weights_hyper::Vector{T}
     formula::FormulaTerm
+end
+
+"""
+    hyper_precision_mean(res, i)
+
+Posterior mean of `exp(θ_i)` (the "precision" scale) computed from the CCD
+mixture. This is what R-INLA prints as `summary.hyperpar\$mean` for a
+log-precision hyperparameter.
+"""
+function hyper_precision_mean(res::INLAResult, i::Int)
+    isempty(res.weights_hyper) && return exp(res.mode_hyper[i])
+    s = 0.0
+    for k in eachindex(res.nodes_hyper)
+        s += res.weights_hyper[k] * exp(res.nodes_hyper[k][i])
+    end
+    return s
 end
 
 # --- Result Summary ---
@@ -41,19 +88,20 @@ function Base.show(io::IO, ::MIME"text/plain", res::INLAResult)
     println(io, "-----------")
     println(io, "Formula: ", res.formula)
     println(io)
-    println(io, "Hyperparameters (Mode):")
+    println(io, "Hyperparameters (mode → mean ± sd):")
     for i in 1:length(res.mode_hyper)
-        @printf(io, "  theta[%d]: %10.4f\n", i, res.mode_hyper[i])
+        @printf(io, "  theta[%d]: %10.4f → %10.4f ± %.4f\n",
+                i, res.mode_hyper[i], res.mean_hyper[i], res.marginals_hyper[i, 2])
     end
     println(io)
-    n = length(res.mode_latent)
-    println(io, "Latent Field Summary (n=$n):")
+    n = length(res.mean_latent)
+    println(io, "Latent Field (n=$n, posterior mean ± sd):")
     limit = min(n, 5)
     @printf(io, "  %-4s  %10s  %10s\n", "i", "mean", "sd")
     for i in 1:limit
         var_val = res.marginals_latent[i]
         sd = sqrt(max(zero(var_val), var_val))
-        @printf(io, "  %-4d  %10.4f  %10.4f\n", i, res.mode_latent[i], sd)
+        @printf(io, "  %-4d  %10.4f  %10.4f\n", i, res.mean_latent[i], sd)
     end
     n > 5 && println(io, "  ...")
 end
@@ -131,7 +179,7 @@ function _build_latent_effect(t, data, n_obs, latent_override)
     val_map = Dict(v => i for (i, v) in enumerate(unique_vals))
     n_unique = length(unique_vals)
 
-    # Choose model instance (user `latent=` argument wins for SPDE-family).
+    # Choose model instance (user `latent=` argument wins for graph/spatial models).
     model = if model_sym === :SPDE
         latent_override isa SPDEModel || latent_override isa NonStationarySPDEModel ?
             latent_override : error("formula uses f(., SPDE) but no SPDE/NonStationarySPDE was passed via latent=")
@@ -141,6 +189,9 @@ function _build_latent_effect(t, data, n_obs, latent_override)
     elseif model_sym === :ICAR
         latent_override isa ICARModel ?
             latent_override : error("formula uses f(., ICAR) but latent= is not an ICARModel")
+    elseif model_sym === :Besag
+        latent_override isa BesagModel ?
+            latent_override : error("formula uses f(., Besag) but latent= is not a BesagModel")
     elseif model_sym === :BivariateIID
         BivariateIIDModel()
     elseif model_sym === :RW1
@@ -154,24 +205,42 @@ function _build_latent_effect(t, data, n_obs, latent_override)
         size(model.C, 1)
     elseif model isa NonStationarySPDEModel
         size(model.C, 1)
+    elseif model isa BesagModel
+        size(model.W, 1)
+    elseif model isa ICARModel
+        size(model.W, 1)
     elseif model isa BivariateIIDModel
         2 * n_unique
     else
         n_unique
     end
 
-    # Build sparse projection A: row j observation, col k latent index = val_map[cov_data[j]].
-    # For BivariateIID we need to handle the type=1/type=2 stacking; for the simple
-    # single-block case (IID/RW1/ICAR) it's a 1-of-K mapping.
+    # Build sparse projection A. Layout depends on model:
+    # - Graph models (Besag/ICAR/SPDE/NonStationarySPDE): the covariate value is
+    #   already a 1-based index into the latent vector. We use it directly so the
+    #   row/column ordering matches the precision matrix W or mesh layout.
+    # - BivariateIID: per-pair stacked latent (u_i, v_i). A `type ∈ {1,2}` column
+    #   on the data picks which of the two slots applies.
+    # - All others (IID, RW1): 1-of-K projection from `cov_data` distinct levels.
+    use_direct_index = model isa BesagModel ||
+                       model isa ICARModel ||
+                       model isa SPDEModel ||
+                       model isa NonStationarySPDEModel
     row_idx = Int[]; col_idx = Int[]; vals = Float64[]
     if model isa BivariateIIDModel
-        # Need a `type` covariate too — convention: column named `type` with values in {1,2}
-        haskey_type = hasproperty(data, :type)
-        haskey_type || error("BivariateIID requires the data to have a `type` column with values 1 or 2")
+        hasproperty(data, :type) ||
+            error("BivariateIID requires a `type` column with values 1 or 2")
         types = data.type
         for j in 1:n_obs
             base = 2 * (val_map[cov_data[j]] - 1) + 1
             push!(row_idx, j); push!(col_idx, base + (types[j] - 1)); push!(vals, 1.0)
+        end
+    elseif use_direct_index
+        for j in 1:n_obs
+            idx = Int(cov_data[j])
+            (1 ≤ idx ≤ n_block) ||
+                error("covariate $cov_name has value $idx out of bounds for n_block=$n_block")
+            push!(row_idx, j); push!(col_idx, idx); push!(vals, 1.0)
         end
     else
         for j in 1:n_obs
@@ -206,6 +275,7 @@ function inla(form::FormulaTerm, data;
               family            = GaussianLikelihood(),
               latent            = nothing,
               theta0::Union{Nothing,AbstractVector{<:Real}} = nothing,
+              offset::Union{Nothing,AbstractVector{<:Real}} = nothing,
               fixed_precision   = DEFAULT_FIXED_PRECISION,
               solver::Symbol    = :bfgs,
               max_outer_iter::Int = 50,
@@ -253,6 +323,15 @@ function inla(form::FormulaTerm, data;
     end
     A_total = hcat(A_blocks...)
 
+    # 4b. Validate / normalize the offset.
+    o_vec = if offset === nothing
+        zeros(Float64, n_obs)
+    else
+        length(offset) == n_obs ||
+            error("offset has length $(length(offset)) but data has $n_obs observations")
+        collect(float.(offset))
+    end
+
     # 5. Hyperparameter layout. Convention:
     #     θ = [ θ_lik …, θ_eff_1 …, θ_eff_2 …, … ]
     n_h_lik  = n_hyper(family)
@@ -299,38 +378,45 @@ function inla(form::FormulaTerm, data;
     # 8. Inner Newton + Laplace at given θ. Reuses last x* as warm start.
     x_warm = zeros(n_latent)
 
-    function laplace_obj(theta::AbstractVector)
+    """
+    Returns the negative-log-posterior `obj`, the latent mode `x_star`, and the
+    sparse Cholesky factor `F` of the Hessian `H`. The optimizer only needs
+    `obj`; the CCD pass downstream needs the full triple.
+    """
+    function laplace_eval(theta::AbstractVector)
         theta_y, eff_slices = _slices(theta)
         Q = build_Q(theta)
 
-        grad_eta_fn, hess_eta_diag_fn = eta_derivatives(family, y_raw, theta_y)
+        # `η_total = A x + offset`. The likelihood derivatives are with respect
+        # to η_total, but `H = Q + A' D(-h_η) A` since the offset is a constant
+        # shift in η that doesn't appear in `dη/dx`.
+        grad_eta_raw, hess_eta_diag_raw = eta_derivatives(family, y_raw, theta_y)
+        grad_eta_offset(eta) = grad_eta_raw(eta .+ o_vec)
+        hess_eta_offset(eta) = hess_eta_diag_raw(eta .+ o_vec)
 
-        # Newton on x given θ. Phase 1 runs the inner loop in Float64;
-        # SuiteSparse Cholesky is Float64-only and AD-wrapping the outer call
-        # is reserved for Phase 2.
-        x_star = gmrf_newton_full(grad_eta_fn, hess_eta_diag_fn, A_total, Q, x_warm)
+        x_star = gmrf_newton_full(grad_eta_offset, hess_eta_offset, A_total, Q, x_warm)
         copyto!(x_warm, x_star)
 
-        # Laplace approximation:
-        #   log π̂(θ|y) = log p(y|η*, θ_y) + log p(x*|θ) − ½ log|H| + log π(θ) + const
-        eta_star = A_total * x_star
-        ll  = log_likelihood_total(family, y_raw, eta_star, theta_y)
-        lp  = -0.5 * dot(x_star, Q * x_star) + 0.5 * sparse_logdet(Q)
+        eta_star = A_total * x_star .+ o_vec
+        ll = log_likelihood_total(family, y_raw, eta_star, theta_y)
+        lp = -0.5 * dot(x_star, Q * x_star) + 0.5 * sparse_logdet(Q)
 
-        h_eta = hess_eta_diag_fn(eta_star)
+        h_eta = hess_eta_diag_raw(eta_star)
         H = Q + sparse(A_total' * spdiagm(0 => -h_eta) * A_total)
         F = cholesky(Symmetric(H))
         log_det_H = 2.0 * logdet(F)
 
-        # Hyperparameter priors.
         lprior = log_prior(family, theta_y)
         for k in eachindex(effects)
             lprior += log_prior(effects[k].model, eff_slices[k])
         end
 
         # Minimise the negative log marginal posterior of θ.
-        return -(ll + lp - 0.5 * log_det_H + lprior)
+        obj = -(ll + lp - 0.5 * log_det_H + lprior)
+        return obj, x_star, F
     end
+
+    laplace_obj(theta) = first(laplace_eval(theta))
 
     # 9. Optimize. For Phase 1 we use BFGS with finite-diff gradients. The
     # closed-form analytic gradient is a Phase 2/3 milestone; finite diff with
@@ -350,63 +436,104 @@ function inla(form::FormulaTerm, data;
                              reltol   = 1e-7)
     theta_star = collect(sol.u)
 
-    # 10. One final pass at θ* to extract the mode and marginals.
-    Q_star = SparseMatrixCSC{Float64,Int}(build_Q(theta_star))
-    theta_y_star, _ = _slices(theta_star)
-    grad_eta_fn, hess_eta_diag_fn = eta_derivatives(family, y_raw, theta_y_star)
+    # 10. CCD integration over θ.
+    # The CCD pass is what turns Julia's joint-mode estimator into a posterior
+    # *mean* estimator (matching what R-INLA reports under summary.fixed\$mean
+    # and summary.hyperpar\$mean). For n_h == 0 we skip integration entirely.
+    obj_star, x_star, F_star = laplace_eval(theta_star)
+    marginals_at_mode = takahashi_diag(F_star)
 
-    x_star = gmrf_newton_full(grad_eta_fn, hess_eta_diag_fn,
-                              A_total, Q_star, x_warm; max_iter = 100, tol = 1e-10)
-    eta_star = A_total * x_star
-    h_eta = hess_eta_diag_fn(eta_star)
-    H_star = Q_star + sparse(A_total' * spdiagm(0 => -h_eta) * A_total)
-    F_star = cholesky(Symmetric(H_star))
-    marginals = takahashi_diag(F_star)
+    if n_h == 0
+        # No hyperparameters: posterior is a single Laplace at θ = (). Return mode.
+        return INLAResult(x_star, x_star,
+                          theta_star, theta_star,
+                          marginals_at_mode,
+                          Matrix{Float64}(undef, 0, 2),
+                          [collect(theta_star)], [1.0], form)
+    end
 
-    # Hyper marginals: Gaussian Laplace at θ* (covariance = H_θ⁻¹ via finite diff).
-    marg_hyper = _hyper_marginals(laplace_obj, theta_star)
+    # Compute the Hessian H_θ at θ* via central finite differences.
+    H_theta = _finitediff_hessian(laplace_obj, theta_star)
+    H_theta = Symmetric(H_theta + 1e-9 * I)  # tiny ridge for numerical PD
 
-    # CCD nodes/weights are populated for Phase 2 — for now we report the mode only.
-    nodes_hyper   = [collect(theta_star)]
-    weights_hyper = [1.0]
+    # Generate CCD nodes around θ* in θ-space.
+    nodes = integration_nodes(theta_star, Matrix(H_theta))
 
-    return INLAResult(x_star, theta_star, marginals, marg_hyper,
-                      nodes_hyper, weights_hyper, form)
+    # Evaluate the posterior at each node, store (x_k, var_k, obj_k).
+    n_nodes  = length(nodes)
+    obj_at   = Vector{Float64}(undef, n_nodes)
+    x_at     = Vector{Vector{Float64}}(undef, n_nodes)
+    var_at   = Vector{Vector{Float64}}(undef, n_nodes)
+    for k in 1:n_nodes
+        # Reset warm start to the global mode each time so neighbouring CCD
+        # nodes don't pollute the inner Newton with stale state.
+        copyto!(x_warm, x_star)
+        obj_k, x_k, F_k = laplace_eval(nodes[k])
+        obj_at[k] = obj_k
+        x_at[k]   = x_k
+        var_at[k] = takahashi_diag(F_k)
+    end
+
+    # Convert −log posterior values into normalized weights.
+    log_w = -(obj_at .- minimum(obj_at))
+    log_w_max = maximum(log_w)
+    w = exp.(log_w .- log_w_max)
+    w ./= sum(w)
+
+    # Mixture posterior moments for the latent field.
+    x_mean = zeros(Float64, n_latent)
+    for k in 1:n_nodes
+        x_mean .+= w[k] .* x_at[k]
+    end
+    marginals_mixed = zeros(Float64, n_latent)
+    for k in 1:n_nodes
+        marginals_mixed .+= w[k] .* (var_at[k] .+ (x_at[k] .- x_mean).^2)
+    end
+
+    # Hyperparameter posterior moments via the same node mixture.
+    theta_mean = zeros(Float64, n_h)
+    for k in 1:n_nodes
+        theta_mean .+= w[k] .* nodes[k]
+    end
+    theta_var = zeros(Float64, n_h)
+    for k in 1:n_nodes
+        theta_var .+= w[k] .* (nodes[k] .- theta_mean).^2
+    end
+    marg_hyper = hcat(theta_mean, sqrt.(max.(0.0, theta_var)))
+
+    return INLAResult(x_star, x_mean,
+                      theta_star, theta_mean,
+                      marginals_mixed, marg_hyper,
+                      [collect(n) for n in nodes], collect(w), form)
 end
 
 """
-    _hyper_marginals(obj, theta_star; eps=1e-3)
+    _finitediff_hessian(f, x; eps=1e-3)
 
-Gaussian approximation of the hyperparameter posterior at the mode: returns an
-`n_hyper × 2` matrix of (mean, sd). Diagonal of (∇²obj)⁻¹ via central finite
-differences. CCD integration in Phase 2 will replace this.
+Central-difference Hessian of a scalar function `f` at `x`. Used at θ* to
+produce the local quadratic shape that drives CCD node placement and the
+hyperparameter Gaussian approximation.
 """
-function _hyper_marginals(obj, theta_star::AbstractVector{T}; eps_::T = T(1e-3)) where {T}
-    n = length(theta_star)
-    n == 0 && return Matrix{T}(undef, 0, 2)
+function _finitediff_hessian(f, x::AbstractVector{T}; eps_::T = T(1e-3)) where {T}
+    n = length(x)
+    n == 0 && return Matrix{T}(undef, 0, 0)
     H = zeros(T, n, n)
-    f0 = obj(theta_star)
+    f0 = f(x)
     for i in 1:n, j in 1:i
         if i == j
-            tp = copy(theta_star); tp[i] += eps_
-            tm = copy(theta_star); tm[i] -= eps_
-            H[i,i] = (obj(tp) - 2*f0 + obj(tm)) / eps_^2
+            tp = copy(x); tp[i] += eps_
+            tm = copy(x); tm[i] -= eps_
+            H[i,i] = (f(tp) - 2*f0 + f(tm)) / eps_^2
         else
-            tpp = copy(theta_star); tpp[i] += eps_; tpp[j] += eps_
-            tpm = copy(theta_star); tpm[i] += eps_; tpm[j] -= eps_
-            tmp = copy(theta_star); tmp[i] -= eps_; tmp[j] += eps_
-            tmm = copy(theta_star); tmm[i] -= eps_; tmm[j] -= eps_
-            H[i,j] = (obj(tpp) - obj(tpm) - obj(tmp) + obj(tmm)) / (4 * eps_^2)
+            tpp = copy(x); tpp[i] += eps_; tpp[j] += eps_
+            tpm = copy(x); tpm[i] += eps_; tpm[j] -= eps_
+            tmp = copy(x); tmp[i] -= eps_; tmp[j] += eps_
+            tmm = copy(x); tmm[i] -= eps_; tmm[j] -= eps_
+            H[i,j] = (f(tpp) - f(tpm) - f(tmp) + f(tmm)) / (4 * eps_^2)
             H[j,i] = H[i,j]
         end
     end
-    Σ = inv(Symmetric(H))
-    out = Matrix{T}(undef, n, 2)
-    for i in 1:n
-        out[i,1] = theta_star[i]
-        out[i,2] = sqrt(max(zero(T), Σ[i,i]))
-    end
-    return out
+    return H
 end
 
 end # module

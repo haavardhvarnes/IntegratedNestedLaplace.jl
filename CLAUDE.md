@@ -147,22 +147,82 @@ Goal: all unit tests pass; example A (Salamander) within tolerance vs R-INLA.
 - [ ] Switch optimizer to BFGS via `OptimizationOptimJL.BFGS()`; supply analytical gradients for the hyperparameter posterior. Until that's in, leave NelderMead as the fallback.
 - [ ] Stand up the parity test for example A (Salamander) using the simpler `Cross + f(Female, IID) + f(Male, IID)` formula with shared τ. Acceptance: τ_F, τ_M within 5% of R-INLA mean.
 
-### Phase 2 — multi-hyper integration
+### Phase 2 — multi-hyper integration  ✅ landed
 
 Goal: integration over θ happens; bivariate models work.
 
-- [ ] Wire `INLACore.integration_nodes` into `inla()`. For `n_hyper ≥ 2`, evaluate the cached objective at every CCD node. Compute weights from the Hessian at the mode (Gaussian-weighted). Return `nodes_hyper`, `weights_hyper`, and a *mixture* `marginals_latent`.
-- [ ] Add `BivariateIIDModel` (3 hypers), wired through the driver (fixes bug 9, 11). Parity on example B (bivariate meta-analysis).
-- [ ] Add `besag(graph)` and `BYM2Model(graph)` with PC priors. Parity on example C (Brunei).
-- [ ] Decide on R-INLA's "Gaussian" vs "simplified Laplace" marginals. Implement Gaussian first; add skewness correction next phase if needed for parity.
+- [x] Wire CCD nodes into `inla()`. For every `n_hyper ≥ 1` we now evaluate the
+  Laplace objective at every CCD node, normalize via softmax of the
+  log-density gap, and return mixture means and variances for both the latent
+  field and the hyperparameter vector. `INLAResult` exposes both `mode_latent`
+  (joint mode at θ*) and `mean_latent` (CCD mixture mean), plus
+  `hyper_precision_mean(res, i)` for the precision-scale mean of `exp(θ_i)`.
+  See [src/IntegratedNestedLaplace.jl](src/IntegratedNestedLaplace.jl).
+- [x] `BivariateIIDModel` reachable through the driver via `f(study, BivariateIID)`.
+  3 hypers (log τ₁, log τ₂, atanh ρ) + an optional `type ∈ {1, 2}` covariate
+  for which slot of the per-pair latent the observation hits. Smoke tested
+  end-to-end with Gaussian likelihood.
+- [x] `BesagModel(W; scale=true, constraint_precision=…)` + `loggamma` prior,
+  with R-INLA-style scale.model normalization (geometric mean of marginal
+  variance under sum-to-zero = 1).
+- [x] Salamander parity stays green at Phase 2 tolerances (10 % × R-INLA SD on
+  fixed-effect means, 10 % rtol on precisions). The remaining mode-vs-mean
+  offset on Bernoulli fixed-effect posteriors is the simplified-Laplace
+  skewness correction territory; lifted to Phase 3.
 
-### Phase 3 — spatial parity
+### Phase 2 deferred to Phase 3
 
-Goal: SPDE example actually runs. Non-stationary SPDE works for example D.
+* **Bivariate meta-analysis strict parity (example B)** — R-INLA's `2diid`
+  uses a Wishart prior on the 2×2 precision matrix; aligning Julia's
+  loggamma+gaussian prior on `(log τ₁, log τ₂, atanh ρ)` with R's Wishart
+  parameterization is non-trivial. The Julia driver path is ready; the
+  fixture is what's missing.
+* **Brunei parity (example C)** — hard sum-to-zero is required. With the soft
+  rank-1 constraint the Laplace objective has its global mode at τ → ∞
+  (u → 0, intercept absorbs everything). R-INLA avoids this by removing the
+  null-space degree of freedom from `Q` and `H` exactly. Implementing the
+  augmented-system constrained Newton is the prerequisite. Documented
+  diagnostics in `dev/notes/` if needed.
+* **Simplified-Laplace marginals** — Phase 1/2 use the Gaussian Laplace at the
+  mode; for Bernoulli the conditional posterior of η is mildly skew, which
+  shifts the posterior mean by O(0.1 × SD). R-INLA's `strategy="simplified.laplace"`
+  default applies a skewness correction. Implementing it tightens the
+  fixed-effect parity tolerance from 10 % × SD to ~1 %.
 
-- [ ] Fix `precision_matrix` dispatch chain so SPDE models can be passed via `latent=`. Move the kappa/tau extraction out of the driver and into a model method `assemble_Q(model, θ_block)`.
-- [ ] Stationary SPDE parity test on a fixed mesh & dataset against R-INLA's `inla.spde2.matern`.
-- [ ] `fbesag` (or a workable equivalent that R-INLA supports) for the non-stationary Brazil example. Parity test on example D.
+### Phase 3 — constrained models, simplified-Laplace, spatial parity
+
+Promoted into Phase 3:
+
+- [ ] **Hard sum-to-zero constraint** via the augmented (KKT) system in the
+  inner Newton. Required for Besag/ICAR/RW1/RW2/BYM/BYM2 to match R-INLA's
+  posterior. Implementation outline:
+  - Driver passes a constraint matrix `A_c` (k × n_latent) and target `e_c`.
+  - At each inner Newton iteration, solve the KKT system
+    `[H A_c'; A_c 0] [dx; λ] = [-g; e_c − A_c x]` instead of `H dx = -g`.
+  - The Cholesky factor of `H` is reused via Schur-complement updates; only
+    the `k × k` block changes per iteration. For k = 1 this is essentially
+    free.
+  - `log |H_constrained|` = `log |H| + log |A_c H⁻¹ A_c'|` (the Schur
+    complement). Update `laplace_obj` accordingly.
+- [ ] Promote `BesagModel`'s soft `constraint_precision` to expose
+  `hard_constraint = true` that hooks into the augmented-system path.
+- [ ] **Brunei parity test** (example C) using `BesagModel` with hard
+  sum-to-zero. Compare per-area linear-predictor mean and SD against R-INLA's
+  `summary.linear.predictor`. Acceptance: ≤ 5 % rtol on each.
+- [ ] **Simplified-Laplace marginal correction** (`strategy="simplified.laplace"`).
+  Implements the skewness correction at each latent coordinate using the
+  third-derivative of the log-likelihood at η*. Tightens fixed-effect parity
+  for non-Gaussian likelihoods.
+- [ ] Bivariate meta-analysis strict parity (example B). Implement Wishart
+  prior on the 2×2 precision via `f(study, BivariateIID)` with a new
+  `prior=:wishart` option matching R-INLA's `param=c(...)` convention.
+- [ ] Fix `precision_matrix` dispatch chain so SPDE models can be passed via
+  `latent=`. Move the kappa/tau extraction out of the driver and into a
+  model method `assemble_Q(model, θ_block)`.
+- [ ] Stationary SPDE parity test on a fixed mesh & dataset against R-INLA's
+  `inla.spde2.matern`.
+- [ ] `fbesag` (or a workable equivalent that R-INLA supports) for the
+  non-stationary Brazil example. Parity test on example D.
 
 ### Phase 4 — joint multi-likelihood
 

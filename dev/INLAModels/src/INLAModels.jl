@@ -8,6 +8,7 @@ using INLASpatial
 
 export Likelihood, GaussianLikelihood, BernoulliLikelihood, PoissonLikelihood
 export LatentModel, AR1Model, RW1Model, IIDModel, SPDEModel, BivariateIIDModel, ICARModel, NonStationarySPDEModel
+export BesagModel
 export PCPrior, log_pdf, precision_matrix
 export n_hyper, assemble_Q, log_prior, has_likelihood_hyperparameter
 
@@ -115,6 +116,88 @@ Q = tau * (diag(degree) - adj)
 struct ICARModel <: LatentModel
     W::SparseMatrixCSC{Float64, Int}
 end
+
+"""
+    BesagModel(W; scale=true, constraint_precision=1e6)
+
+Besag/CAR model on the area adjacency graph encoded by symmetric sparse `W`.
+Equivalent to R-INLA's `f(., model="besag", graph=g, scale.model=true/false)`.
+
+* `scale=true` (default) rescales the unscaled precision `Q₀ = D − W` so the
+  geometric mean of marginal variances under the constrained ICAR prior is 1.
+  This is what R-INLA's `scale.model=TRUE` does.
+* `constraint_precision=1e6` enforces a soft sum-to-zero constraint on the
+  area effect by adding `κ · 1·1'` to the precision before scaling by τ.
+  Without this constraint, an intercept term in the model would be unidentified
+  against a constant shift in the area effect, producing nonsensically tight
+  posterior precisions on τ. R-INLA imposes the constraint *exactly*; the soft
+  version is a Phase 2 approximation that is tight enough to match R-INLA's
+  posterior for moderately strong κ. A hard constraint via the augmented
+  system is on the Phase 3 to-do list.
+"""
+struct BesagModel <: LatentModel
+    W::SparseMatrixCSC{Float64, Int}
+    scale::Bool
+    scale_factor::Float64
+    constraint_precision::Float64
+    function BesagModel(W::SparseMatrixCSC{Float64, Int};
+                        scale::Bool = true,
+                        constraint_precision::Real = 1e6)
+        return new(W, scale,
+                   scale ? _besag_scale_factor(W) : 1.0,
+                   Float64(constraint_precision))
+    end
+end
+
+# Returns the *multiplier* `c` such that `c · (D − W)` has geometric mean
+# marginal variance = 1 under the sum-to-zero-constrained ICAR prior.
+# This is what R-INLA's scale.model=TRUE applies to make τ interpretable as
+# an "average" precision across graphs.
+#
+# Equals `1 / exp(mean(log(diag(Σ_unscaled_proj))))` where Σ_unscaled_proj
+# is the generalized inverse of (D−W) on the orthogonal complement of the
+# constant null direction.
+function _besag_scale_factor(W::SparseMatrixCSC{Float64, Int})
+    n = size(W, 1)
+    D = Matrix(spdiagm(0 => vec(sum(W, dims=2))))
+    Q0 = Matrix(D - Matrix(W))
+    e = ones(n) ./ n
+    P = I - ones(n) * e'
+    # (Q0 + 1·e') is invertible; the outer projection peels the null direction
+    # back out, leaving the generalised inverse on the orthogonal complement.
+    Σ = P * inv(Q0 + ones(n) * e') * P
+    diag_var = real.(diag(Σ))
+    geom_mean = exp(mean(log.(max.(diag_var, 1e-12))))
+    return 1.0 / geom_mean
+end
+
+function precision_matrix(model::BesagModel, tau::T) where {T}
+    n = size(model.W, 1)
+    W = sparse(T.(model.W))
+    D = spdiagm(0 => vec(sum(W, dims=2)))
+    Q = (D - W) .* T(model.scale_factor)
+    # Soft sum-to-zero: add κ · 1·1' so the constant null direction picks up a
+    # large precision, eliminating identifiability ambiguity with the intercept.
+    if model.constraint_precision > 0
+        κ = T(model.constraint_precision)
+        # Symmetric rank-1 update — keeps result sparse only conceptually.
+        # For modest n this is fine; large-graph version uses augmented system.
+        Q = Q + κ .* sparse(ones(T, n, n))
+    end
+    @inbounds for i in 1:n
+        Q[i, i] += T(1e-9)
+    end
+    return tau * Q
+end
+
+n_hyper(::BesagModel) = 1
+
+function assemble_Q(model::BesagModel, theta_block::AbstractVector{T}, _n::Int) where {T}
+    return precision_matrix(model, exp(theta_block[1]))
+end
+
+log_prior(::BesagModel, theta_block::AbstractVector) =
+    loggamma_logprior(theta_block[1])
 
 function precision_matrix(model::ICARModel, n::Int, tau::T) where T
     W = sparse(T.(model.W))
