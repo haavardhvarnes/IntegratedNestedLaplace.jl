@@ -1,16 +1,13 @@
 using IntegratedNestedLaplace
 using DataFrames
+using Random
 using SparseArrays
 using LinearAlgebra
 using Distributions
 
-# 1. Mock Oral Cancer Data (544 Districts)
-# For the prototype, we use a 100-district subset for speed
-function get_cancer_data(n=100)
-    # y ~ Poisson(E * exp(eta))
-    # For now, simplify to Gaussian for demonstration of the DSL
-    E = rand(0.5:0.1:2.0, n)
-    y = [rand(Poisson(ei * 1.5)) for ei in E]
+function get_cancer_data(n=100; rng = MersenneTwister(20260426))
+    E = rand(rng, 0.5:0.1:2.0, n)
+    y = [rand(rng, Poisson(ei * 1.5)) for ei in E]
     df = DataFrame(y = Float64.(y), district = 1:n)
     return df
 end

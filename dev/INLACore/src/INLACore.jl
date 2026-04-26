@@ -11,9 +11,10 @@ using Enzyme
 import ForwardDiff
 using KernelAbstractions
 
-export find_mode, SparseHessianCache, sparse_hessian!, gmrf_newton
+export find_mode, SparseHessianCache, sparse_hessian!, gmrf_newton, gmrf_newton_full
 export takahashi_factor!, takahashi_marginals, integration_nodes
 export sparse_trace_inverse, gaussian_ll_kernel, gaussian_ll_grad_kernel, sparse_logdet
+export inverse_permutation, takahashi_diag
 
 # --- Sparse Hessian (DI) ---
 
@@ -37,8 +38,12 @@ end
 """
     gmrf_newton(grad_lik, hess_lik, Q, x0; max_iter=20, tol=1e-8)
 
-Specialized Sparse Newton solver. Finds mode of p(x|y).
-grad_lik and hess_lik should return vectors of likelihood gradient and Hessian diagonal.
+Specialized Sparse Newton solver. Finds the mode of `p(x|y) ∝ exp(ℓ(x) − ½ x' Q x)`
+when `ℓ` has a *diagonal* Hessian in `x` itself (the per-coordinate setup, e.g.
+when `x = η`). For models with a wide design matrix `A` so that `η = A x`, use
+`gmrf_newton_full` instead.
+
+`grad_lik` returns `∇ℓ(x)`; `hess_lik` returns the diagonal of `∇²ℓ(x)`.
 """
 function gmrf_newton(grad_lik, hess_lik, Q::SparseMatrixCSC{T}, x0::Vector{T}; max_iter=20, tol=1e-8) where T
     x = copy(x0)
@@ -47,6 +52,45 @@ function gmrf_newton(grad_lik, hess_lik, Q::SparseMatrixCSC{T}, x0::Vector{T}; m
         h_l = hess_lik(x)
         g = Q * x - g_l
         H = Q + spdiagm(0 => -h_l)
+        F = cholesky(Symmetric(H))
+        dx = F \ g
+        x .-= dx
+        if norm(dx, Inf) < tol
+            return x
+        end
+    end
+    return x
+end
+
+"""
+    gmrf_newton_full(grad_eta, hess_eta_diag, A, Q, x0; max_iter=20, tol=1e-8)
+
+Sparse Newton for latent x with linear predictor η = A·x and a likelihood whose
+Hessian in η is diagonal (the standard generalized-linear case). The full
+sparse Hessian in x is `H = Q + A' Diagonal(−h_η(η)) A`.
+
+Inputs:
+* `grad_eta(eta)`  — `∂ℓ/∂η_i` per observation, length `n_obs`.
+* `hess_eta_diag(eta)` — `∂²ℓ/∂η_i²` per observation (negative for log-concave
+  likelihoods), length `n_obs`.
+* `A`  — `n_obs × n_latent` sparse design.
+* `Q`  — `n_latent × n_latent` sparse latent precision.
+
+Returns the latent mode `x*` (vector). The Cholesky factor is *not* returned;
+the caller can reconstruct it cheaply at `x*`.
+"""
+function gmrf_newton_full(grad_eta, hess_eta_diag,
+                          A::SparseMatrixCSC{T}, Q::SparseMatrixCSC{T},
+                          x0::Vector{T}; max_iter::Int = 50, tol = T(1e-8)) where {T}
+    x = copy(x0)
+    AT = sparse(A')
+    for _ in 1:max_iter
+        eta = A * x
+        g_eta = grad_eta(eta)
+        h_eta = hess_eta_diag(eta)        # h_eta[i] is ∂²ℓ/∂η_i²; negative for log-concave likelihoods
+        g = Q * x - AT * g_eta            # ∇ of (-log posterior) up to sign convention
+        D = spdiagm(0 => -h_eta)          # positive diagonal
+        H = Q + AT * D * A
         F = cholesky(Symmetric(H))
         dx = F \ g
         x .-= dx
@@ -136,6 +180,50 @@ function sparse_logdet(Q::SparseMatrixCSC{T}) where T
     Q_f64 = SparseMatrixCSC{Float64, Int}(Q)
     F = cholesky(Symmetric(Q_f64))
     return T(2.0 * logdet(F))
+end
+
+"""
+    inverse_permutation(p)
+
+Return the inverse permutation of `p`, i.e. `q[p[i]] = i`. Useful for mapping
+back from CHOLMOD's AMD ordering to the original variable order.
+"""
+function inverse_permutation(p::AbstractVector{<:Integer})
+    q = similar(p)
+    @inbounds for i in eachindex(p)
+        q[p[i]] = i
+    end
+    return q
+end
+
+"""
+    takahashi_diag(F)
+
+Return per-coordinate variances `Σ_ii` of the inverse of a CHOLMOD
+sparse-Cholesky `F` (i.e. `F.factors == F.L F.L'` after permutation `F.p`).
+The output is in the *original* variable order — the AMD permutation is
+inverted internally.
+
+This is the right thing to use to extract `marginals_latent` after factoring a
+GMRF Hessian.
+"""
+function takahashi_diag(F::SparseArrays.CHOLMOD.Factor{T}) where {T}
+    L = sparse(F.L)
+    S = copy(L)
+    takahashi_factor!(S, L)
+    n = size(L, 1)
+    p = F.p
+    vars = zeros(T, n)
+    @inbounds for j in 1:n
+        # diagonal entry of S in permuted column j → original index p[j]
+        for ptr in S.colptr[j]:(S.colptr[j+1]-1)
+            if S.rowval[ptr] == j
+                vars[p[j]] = S.nzval[ptr]
+                break
+            end
+        end
+    end
+    return vars
 end
 
 # --- Kernels ---

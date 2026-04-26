@@ -1,27 +1,19 @@
 using IntegratedNestedLaplace
 using DataFrames
+using Random
 using Statistics
 
 println("--- Example 05: Bivariate Meta-Analysis (Correlated Effects) ---")
 
-# 1. Generate Synthetic Meta-Analysis Data
-# 20 studies, each providing a pair of observations (e.g., logit-sens and logit-spec)
-function get_meta_data(n_studies=20)
-    # Correlation rho = 0.6
-    # Precisions tau1=2.0, tau2=1.5
+function get_meta_data(n_studies=20; rng = MersenneTwister(20260426))
     studies = Int[]
     y = Float64[]
     type = Int[]
-    
     for i in 1:n_studies
-        # True latent values
-        u = [randn() * 0.5, randn() * 0.7] # mock correlation later
-        # Study i, type 1
-        push!(studies, i); push!(y, u[1] + randn()*0.1); push!(type, 1)
-        # Study i, type 2
-        push!(studies, i); push!(y, u[2] + randn()*0.1); push!(type, 2)
+        u = [randn(rng) * 0.5, randn(rng) * 0.7]
+        push!(studies, i); push!(y, u[1] + randn(rng)*0.1); push!(type, 1)
+        push!(studies, i); push!(y, u[2] + randn(rng)*0.1); push!(type, 2)
     end
-    
     df = DataFrame(y = y, study = studies, type = type)
     return df
 end

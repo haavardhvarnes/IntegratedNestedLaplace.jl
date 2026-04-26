@@ -9,6 +9,7 @@ using INLASpatial
 export Likelihood, GaussianLikelihood, BernoulliLikelihood, PoissonLikelihood
 export LatentModel, AR1Model, RW1Model, IIDModel, SPDEModel, BivariateIIDModel, ICARModel, NonStationarySPDEModel
 export PCPrior, log_pdf, precision_matrix
+export n_hyper, assemble_Q, log_prior, has_likelihood_hyperparameter
 
 # --- Priors ---
 
@@ -74,16 +75,25 @@ end
 
 struct RW1Model <: LatentModel end
 
-function precision_matrix(::RW1Model, n::Int, tau::T) where T
+# RW1 is intrinsic (constant null space). We add a tiny, *prior-neutral* numeric
+# jitter so the result is positive-definite for Cholesky factorization. A real
+# fix is the sum-to-zero constraint that lands in Phase 2.
+const RW1_NUMERIC_JITTER = 1.0e-6
+
+function precision_matrix(::RW1Model, n::Int, tau::T) where {T}
     Q = spzeros(T, n, n)
     for i in 1:n
-        if i == 1 || i == n; Q[i, i] = one(T)
-        else Q[i, i] = T(2.0) * one(T)
+        if i == 1 || i == n
+            Q[i, i] = one(T)
+        else
+            Q[i, i] = T(2)
         end
         i > 1 && (Q[i, i-1] = -one(T))
         i < n && (Q[i, i+1] = -one(T))
     end
-    for i in 1:n; Q[i, i] += T(0.1); end
+    for i in 1:n
+        Q[i, i] += T(RW1_NUMERIC_JITTER)
+    end
     return tau * Q
 end
 
@@ -136,5 +146,134 @@ function precision_matrix(model::NonStationarySPDEModel, theta_kappa::AbstractVe
     Q = spdiagm(0 => sqrt.(tau)) * Q * spdiagm(0 => sqrt.(tau))
     return Q
 end
+
+# --- Hyperparameter interface (Phase 1) ---
+#
+# Every latent model declares:
+#   n_hyper(model)                 -> Int            # number of hypers it owns
+#   assemble_Q(model, theta_block, n)                # build sparse Q given log-scale hypers
+#   log_prior(model, theta_block)  -> Real           # log prior on those hypers
+#
+# Likewise, every likelihood declares:
+#   has_likelihood_hyperparameter(::Likelihood)      # Bool
+#   n_hyper(::Likelihood)                            # 0 or 1 by default
+#   log_prior(::Likelihood, theta_y)                 # log prior on θ_y
+#
+# `theta_block` is the slice of the global hyperparameter vector that the
+# model owns, on the unconstrained scale (log-precision, atanh-correlation, …).
+
+# Default: zero hypers.
+n_hyper(::Any) = 0
+log_prior(::Any, theta_block::AbstractVector) = zero(eltype(theta_block))
+
+# --- Default log-Gamma(1, 5e-5) prior on log-precision (R-INLA's default). ---
+const _LGAMMA_A_DEFAULT = 1.0
+const _LGAMMA_B_DEFAULT = 5e-5
+
+"""
+    loggamma_logprior(theta_log_tau; a=1.0, b=5e-5)
+
+Log density of the log-Gamma prior on θ = log(τ) used as R-INLA's default for
+IID/RW/etc precisions. Formula:
+
+    p(θ) = b^a / Γ(a) · exp(a θ − b exp(θ))
+
+so log p(θ) = a θ − b exp(θ) + a log(b) − log Γ(a).
+Constants are kept (drop them only if profiling shows it matters).
+"""
+function loggamma_logprior(theta::T; a = _LGAMMA_A_DEFAULT, b = _LGAMMA_B_DEFAULT) where {T}
+    a_T = T(a); b_T = T(b)
+    return a_T * theta - b_T * exp(theta) + a_T * log(b_T)  # − log Γ(a) drops out for a=1
+end
+
+# --- IIDModel ---
+n_hyper(::IIDModel) = 1
+
+function assemble_Q(model::IIDModel, theta_block::AbstractVector{T}, n::Int) where {T}
+    return precision_matrix(model, n, exp(theta_block[1]))
+end
+
+log_prior(::IIDModel, theta_block::AbstractVector) =
+    loggamma_logprior(theta_block[1])
+
+# --- RW1Model ---
+n_hyper(::RW1Model) = 1
+
+function assemble_Q(model::RW1Model, theta_block::AbstractVector{T}, n::Int) where {T}
+    return precision_matrix(model, n, exp(theta_block[1]))
+end
+
+log_prior(::RW1Model, theta_block::AbstractVector) =
+    loggamma_logprior(theta_block[1])
+
+# --- ICARModel ---
+n_hyper(::ICARModel) = 1
+
+function assemble_Q(model::ICARModel, theta_block::AbstractVector{T}, n::Int) where {T}
+    return precision_matrix(model, n, exp(theta_block[1]))
+end
+
+log_prior(::ICARModel, theta_block::AbstractVector) =
+    loggamma_logprior(theta_block[1])
+
+# --- BivariateIIDModel ---
+# 3 hypers: log τ1, log τ2, atanh(ρ). n is the latent-block length and must be even.
+n_hyper(::BivariateIIDModel) = 3
+
+function assemble_Q(model::BivariateIIDModel, theta_block::AbstractVector{T}, n::Int) where {T}
+    n_pairs = div(n, 2)
+    n_pairs * 2 == n || error("BivariateIIDModel needs an even latent length, got $n")
+    tau1 = exp(theta_block[1])
+    tau2 = exp(theta_block[2])
+    rho  = tanh(theta_block[3])
+    return precision_matrix(model, n_pairs, tau1, tau2, rho)
+end
+
+# Loose default: independent loggamma on the two precisions, weakly informative N(0,1) on z = atanh ρ.
+function log_prior(::BivariateIIDModel, theta_block::AbstractVector{T}) where {T}
+    return loggamma_logprior(theta_block[1]) +
+           loggamma_logprior(theta_block[2]) +
+           T(-0.5) * theta_block[3]^2
+end
+
+# --- SPDEModel ---
+n_hyper(::SPDEModel) = 2  # log κ, log τ
+
+function assemble_Q(model::SPDEModel, theta_block::AbstractVector{T}, n::Int) where {T}
+    kappa = exp(theta_block[1])
+    tau   = exp(theta_block[2])
+    return precision_matrix(model, kappa, tau)
+end
+
+# Weakly informative default; PC priors come in Phase 2.
+function log_prior(::SPDEModel, theta_block::AbstractVector{T}) where {T}
+    return T(-0.5) * (theta_block[1]^2 + theta_block[2]^2)
+end
+
+# --- NonStationarySPDEModel ---
+n_hyper(model::NonStationarySPDEModel) = size(model.B_kappa, 2) + size(model.B_tau, 2)
+
+function assemble_Q(model::NonStationarySPDEModel, theta_block::AbstractVector{T}, n::Int) where {T}
+    p_k = size(model.B_kappa, 2)
+    p_t = size(model.B_tau,   2)
+    @assert length(theta_block) == p_k + p_t
+    theta_kappa = theta_block[1:p_k]
+    theta_tau   = theta_block[(p_k+1):(p_k+p_t)]
+    return precision_matrix(model, theta_kappa, theta_tau)
+end
+
+function log_prior(model::NonStationarySPDEModel, theta_block::AbstractVector{T}) where {T}
+    return T(-0.5) * sum(abs2, theta_block)
+end
+
+# --- Likelihoods ---
+has_likelihood_hyperparameter(::Likelihood) = false
+has_likelihood_hyperparameter(::GaussianLikelihood) = true
+
+n_hyper(::Likelihood) = 0
+n_hyper(::GaussianLikelihood) = 1
+
+log_prior(::Likelihood, theta::AbstractVector) = zero(eltype(theta))
+log_prior(::GaussianLikelihood, theta::AbstractVector) = loggamma_logprior(theta[1])
 
 end # module

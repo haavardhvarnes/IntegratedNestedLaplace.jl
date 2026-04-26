@@ -1,13 +1,12 @@
 using IntegratedNestedLaplace
 using RDatasets
 using DataFrames
+using Random
 using Statistics
 
-# 1. Fetch Data
-function get_tokyo_data()
-    # Mocking count data for better stability in this prototype
+function get_tokyo_data(rng = MersenneTwister(20260426))
     n = 366
-    y = rand(0:3, n)
+    y = rand(rng, 0:3, n)
     df = DataFrame(y = y, day = 1:n)
     return df
 end

@@ -1,0 +1,229 @@
+# IntegratedNestedLaplace.jl — Correctness & Parity Fix Plan
+
+> Working branch: `worktree-inla-correctness-fix`
+> Status: read-only review complete; this plan drives the fix-up work.
+
+## 0. Mission
+
+Bring `IntegratedNestedLaplace.jl` to a state where:
+
+1. **Correctness:** for the official R-INLA reference examples (https://r-inla.org/examples/index.html), the Julia package reproduces R-INLA's posterior summaries within numerical tolerance.
+2. **Performance:** warm (second-run) wall time is comparable to or better than R-INLA's `cpu.used["Total"]` on the same problem. Cold time (TTFX) is acknowledged as a Julia compilation cost and is *not* the success metric.
+3. **No regressions in the math primitives** (`INLACore`, `INLASpatial`) which already pass their tests.
+
+## 1. Reference targets — five R-INLA examples
+
+These are the benchmarks every change must keep working. For each one we will commit a frozen R-INLA reference output (means, SDs, quantiles for fixed effects and hyperparameters) under `test/fixtures/<name>/rinla_reference.json` and a Julia comparison test that asserts agreement.
+
+| # | Reference page | Existing Julia stub | Likelihood | Latent structure | Hypers |
+|---|---|---|---|---|---|
+| A | [Salamander mating](https://r-inla.org/examples/salamander/salamander/salamander.html) | `examples/04_salamander_mating/model.jl` | Bernoulli (binomial, n=1) | `iid2d` (experiments 1–2 female and male) + `iid` (experiment 3 female and male) | 6 (3 per `iid2d` block × 2 + 2 `iid`) |
+| B | [Bivariate meta-analysis](https://r-inla.org/examples/bivariate-meta/bivariate-meta/bivmeta.html) | `examples/05_meta_analysis/model.jl` | Binomial (Ntrials=N) | `2diid` for study-level (sens, spec) | 3 (τ_μ, τ_ν, ρ) |
+| C | [Brunei school disparities](https://r-inla.org/examples/AlvinBong/alvinbong-example.html) | `examples/06_brunei_school_disparities/model.jl` | Poisson with offset E | `bym2(graph)` + 3 fixed-effect covariates | 2 (BYM2 precision + φ mixing) |
+| D | [Dengue Brazil non-stationary](https://r-inla.org/examples/fbesagExample/brazil_fbesag_workflow_pro_cited.html) | `examples/07_dengue_brazil/model.jl` | Poisson with offset E | Stationary `besag` baseline; non-stationary `fbesag` extension | 1 (besag) → many (fbesag) |
+| E | [Joint longitudinal/spatial](https://r-inla.org/examples/Baghfalaki_et_al/Baghfalaki-et-al-example.html) | none yet | mixed: Gaussian + Weibull | B-spline + `iid2d` + `besag` + shared (`copy`) effects | many |
+
+The current `examples/01_tokyo_rainfall`, `02_german_oral_cancer`, `03_swiss_rainfall` are *not* on the official index but are useful smoke tests; we will keep them but realign them to canonical R-INLA tutorials where one exists (Tokyo rainfall and German oral cancer are both in the standard R-INLA case study set).
+
+**Per-example assets we will produce:**
+
+```
+examples/<id>/
+  data/                  # the actual data (committed if small, fetched otherwise)
+  rinla.R                # canonical R-INLA fit → writes JSON + RDS reference
+  model.jl               # Julia INLA fit using same data and formula
+  rinla_reference.json   # generated; checked in
+test/parity/<id>_test.jl # asserts |Julia − R-INLA| under tolerance
+```
+
+Acceptance bar (per example):
+- |posterior mean (fixed)| − R-INLA mean| ≤ max(1e-3, 1% × R-INLA SD)
+- |posterior SD (fixed) − R-INLA SD| / R-INLA SD ≤ 5%
+- log-precision posterior mean within 0.05 of R-INLA's (≈5% on the precision scale)
+- ρ (when present) within 0.02 of R-INLA's
+- warm wall time ≤ 2× R-INLA's `cpu.used["Total"]`
+
+## 2. Findings to fix (from the read-only review)
+
+These are **bugs**, not nice-to-haves. Each links to the line(s) where it lives in `main`.
+
+### 2.1 Showstopper bugs in `inla()` driver (`src/IntegratedNestedLaplace.jl`)
+
+1. **Empty-effects sum** at L158: `sum(e.n_params for e in effects)` errors on `y ~ 1`. Add `init=0` or restructure.
+2. **`SPDEModel` precision dispatch** at L172: driver calls `precision_matrix(model, n_params, tau)` but `SPDEModel`'s method is `(model, kappa, tau)`. Same for `BivariateIIDModel`, `NonStationarySPDEModel`. Driver must dispatch by model type and pass the correct hypers.
+3. **Hessian is just its diagonal** at L188 — `diag(A' diag(h) A)` instead of `A' diag(h) A`. Wrong by O(n²) entries. This alone explains the 1000× precision discrepancy on Salamander.
+4. **Marginals not back-permuted** at L207–224. `S` is stored in the AMD-permuted basis (`F.p`) and `diag(S)` is read off without `vars[F.p[j]] = S[j,j]`. Per-coordinate variances are silently scrambled.
+5. **No Gaussian observation precision.** L195 calls `INLAModels.log_pdf(family, y, eta, 1.0)` with τ_y hardcoded. R-INLA always estimates this. Must become a hyperparameter.
+6. **No actual integration over θ.** Line 232 returns `[[theta_star[1]]]` and `[1.0]`. The CCD machinery (`INLACore.integration_nodes`) is never invoked. Empirical Bayes ≠ INLA.
+7. **Gradient is a placeholder** (L217: `grad[i] = 0.0`). Forces NelderMead, which is why even cold runs on n=50 take seconds.
+8. **`theta0` argument silently ignored** — driver always starts at `fill(1.0, n_h)` (L228).
+9. **`n_h` collapses multi-hyper models to 1**: L161 sets `n_h = length(effects)`, so 3-hyper bivariate-IID and 4-hyper non-stationary SPDE are silently optimized as 1-D. Hypers must be enumerated per-model via a method `n_hyper(model)`.
+
+### 2.2 Modeling layer issues (`dev/INLAModels/src/INLAModels.jl`)
+
+10. **`RW1Model` adds a +0.1 ridge** at L86 to make the precision PSD. This changes the prior. Replace with the genuine intrinsic RW1 (rank-deficient) plus a sum-to-zero constraint or a tiny *documented* numerical diagonal (e.g. 1e-9) used only for factorization, not for the prior.
+11. **Bivariate IID hyperparameters not plumbed.** `precision_matrix(::BivariateIIDModel, n_pairs, τ₁, τ₂, ρ)` exists, but the driver only ever passes one τ.
+12. **No PC priors used in the driver.** `PCPrior` exists but the driver hard-codes a Gaussian prior on θ at L204 (`-0.5 * sum(theta.^2)`). Each model type needs to declare its prior.
+13. **No fixed-effect prior.** Driver uses `1e-6 * I` (L169) — near-flat. R-INLA uses N(0, 1000). Match the standard or expose it.
+14. **No constraint mechanism.** Intrinsic models (RW1, BYM, ICAR, besag) need sum-to-zero constraints to be identifiable alongside an intercept. Currently absent — explains the −1.7e8 latent values on Salamander.
+
+### 2.3 Architectural gaps (vs. parity targets)
+
+15. **Missing models needed for the five reference examples:**
+    - `iid2d`, `2diid` (bivariate per-pair latent block) — required for A and B.
+    - `bym2` (Riebler 2016 mixing parameterization) — required for C.
+    - `besag` (proper CAR with sum-to-zero) — required for D.
+    - `fbesag` (non-stationary besag) — required for D.
+    - `copy` mechanism (shared effects across multiple linear predictors) — required for E.
+    - Stacked multi-likelihood support (`family = c("gaussian", "weibullsurv")`) — required for E.
+    - Offsets (the `E` argument in Poisson) and `Ntrials` (binomial size) — required for B, C, D.
+
+### 2.4 Hygiene & infrastructure
+
+16. Subpackage `Project.toml`s have no `[targets]` test block → `Pkg.test()` fails for INLACore/INLAModels/INLASpatial.
+17. Examples use unseeded `rand()` — non-reproducible.
+18. No CI configured.
+19. `docs/make.jl` is empty.
+20. `LICENSE` missing.
+21. Several heavy `using`s in `src/IntegratedNestedLaplace.jl` (Enzyme, ImplicitDifferentiation, Metal, Meshes, RecipesBase) are unused — drop them.
+
+## 3. Architectural decisions (binding for this branch)
+
+These are conventions that the rest of the plan assumes. Revisit only with explicit user sign-off.
+
+- **Joint mode via the augmented system.** Stack fixed and random effects into a single x of length n_latent. Use the **Schur complement / sparse Cholesky** form: `H = Q_x + A' D(τ_y) A` (no diagonal-only approximation). All examples assume `update_cache!` constructs this full `H`.
+- **AMD ordering.** Wrap `cholesky(H; perm=...)` and **always** un-permute when reading marginals. A small `inverse_permutation(F.p)` helper goes in `INLACore`.
+- **Hyperparameters.** Enumerate per model:
+  ```
+  n_hyper(::IIDModel) = 1                   # log τ
+  n_hyper(::RW1Model) = 1
+  n_hyper(::AR1Model) = 2                   # log τ, logit-shifted ρ
+  n_hyper(::SPDEModel) = 2                  # log κ, log τ
+  n_hyper(::ICARModel) = 1
+  n_hyper(::BivariateIIDModel) = 3          # log τ₁, log τ₂, atanh ρ
+  n_hyper(::NonStationarySPDEModel) = 2*p_κ + 2*p_τ  (configurable)
+  n_hyper(::BYM2Model) = 2                  # log τ, logit φ
+  n_hyper(::BesagModel) = 1
+  ```
+  Plus one per Gaussian likelihood: `n_hyper(::GaussianLikelihood) = 1`. Driver totals these.
+- **Hyper prior interface.** `log_prior(model, θ_block) -> Real`. Default: PC where standard, else weakly informative. Driver sums them.
+- **Optimizer.** Newton/BFGS with analytic gradients. The closed-form for ∂(−log π(θ|y))/∂θ uses the cached Cholesky and Takahashi marginals; specifically:
+  ```
+  ∂obj/∂θ = ½ tr(H⁻¹ ∂H/∂θ) − ½ tr(Q⁻¹ ∂Q/∂θ) − ½ x*' ∂Q/∂θ x* + ∂(−log π(θ))/∂θ
+  ```
+  Each ∂Q/∂θ for the supported models is closed-form sparse. `INLACore.sparse_trace_inverse` already exists for the trace term.
+- **Integration over θ (the "I" in INLA).** Use `INLACore.integration_nodes` (CCD). Default to mode-only when `n_hyper == 1`; switch to CCD for ≥ 2. Recombine via Gaussian-weighted mixture for marginal latent posteriors.
+- **Marginals.** Two levels: (a) Gaussian Laplace (mean = mode, var = Takahashi diag) — fast default; (b) simplified Laplace approximation (skewness correction) — opt-in `marginals=:simplified`. R-INLA's "simplified Laplace" is the gold standard; we implement (a) for v0 and add (b) before claiming parity on skewed posteriors.
+- **Numeric type.** All math kernels parametric in `T<:Real`. Driver coerces inputs through `eltype(theta)` so AD works.
+- **No silent diag ridges.** Any tiny shift used for factorization is named (`PRIOR_RIDGE = 1e-9`) and documented.
+- **Constraints.** Implement A_constraint*x = e via the standard "soft constraint" trick (extending the system) for v0; revisit hard linear constraints if R-INLA's `extraconstr` is required.
+
+## 4. Phased work plan
+
+Each phase ends with green tests on the cumulative parity bench.
+
+### Phase 0 — scaffolding (no behavior change)
+
+- [ ] Add `[targets]` test blocks to `INLACore`, `INLAModels`, `INLASpatial` Project.toml so `Pkg.test()` works.
+- [ ] Add `LICENSE` (MIT, matching the SciML default).
+- [ ] Add a minimal CI: `julia --project=. test/runtests.jl` on macOS + linux for Julia LTS and stable. Run the parity bench at low frequency (nightly) since it depends on R.
+- [ ] Add `test/fixtures/` and `test/parity/` directory layout. Add a small Julia helper (`test/parity/parity_helpers.jl`) that loads `rinla_reference.json` and exposes `assert_parity(julia_result, ref; tol)`.
+- [ ] Add `bench/Rrun.sh` — runs `Rscript examples/<id>/rinla.R` and writes the JSON reference. Idempotent. CI publishes the JSONs as artifacts.
+- [ ] Pin random seeds in all current example data generators.
+- [ ] Drop unused `using`s in `src/IntegratedNestedLaplace.jl`.
+
+### Phase 1 — driver correctness (single-hyper models)
+
+Goal: all unit tests pass; example A (Salamander) within tolerance vs R-INLA.
+
+- [ ] Fix bug 1 (empty effects), 2 (SPDE dispatch via `precision_matrix(model, θ_block, n)` with model-specific θ unpacking), 8 (`theta0` plumbing).
+- [ ] Replace the diag-only Hessian with the full sparse `H = Q + A' D(−h_eta) A` (bug 3).
+- [ ] Fix marginal back-permutation (bug 4); add a regression test that compares `marginals_latent` to `diag(inv(Matrix(H)))` on a small dense problem.
+- [ ] Introduce `n_hyper(model)` and `precision_matrix(model, θ_block, n)`. Driver builds `Q = blockdiag(...)` from each model's slice of θ.
+- [ ] Add Gaussian likelihood hyperparameter (bug 5); include it as θ[end] when `family isa GaussianLikelihood`.
+- [ ] Add `log_prior(model, θ_block)` and `log_prior(::GaussianLikelihood, θ)`. Replace L204's hard-coded `0.5 * sum(θ.^2)`.
+- [ ] Add fixed-effect prior `N(0, 1000)`; drop the `1e-6 * I` magic.
+- [ ] Add sum-to-zero constraint for intrinsic models (RW1, ICAR, BYM, besag) when an intercept is present.
+- [ ] Switch optimizer to BFGS via `OptimizationOptimJL.BFGS()`; supply analytical gradients for the hyperparameter posterior. Until that's in, leave NelderMead as the fallback.
+- [ ] Stand up the parity test for example A (Salamander) using the simpler `Cross + f(Female, IID) + f(Male, IID)` formula with shared τ. Acceptance: τ_F, τ_M within 5% of R-INLA mean.
+
+### Phase 2 — multi-hyper integration
+
+Goal: integration over θ happens; bivariate models work.
+
+- [ ] Wire `INLACore.integration_nodes` into `inla()`. For `n_hyper ≥ 2`, evaluate the cached objective at every CCD node. Compute weights from the Hessian at the mode (Gaussian-weighted). Return `nodes_hyper`, `weights_hyper`, and a *mixture* `marginals_latent`.
+- [ ] Add `BivariateIIDModel` (3 hypers), wired through the driver (fixes bug 9, 11). Parity on example B (bivariate meta-analysis).
+- [ ] Add `besag(graph)` and `BYM2Model(graph)` with PC priors. Parity on example C (Brunei).
+- [ ] Decide on R-INLA's "Gaussian" vs "simplified Laplace" marginals. Implement Gaussian first; add skewness correction next phase if needed for parity.
+
+### Phase 3 — spatial parity
+
+Goal: SPDE example actually runs. Non-stationary SPDE works for example D.
+
+- [ ] Fix `precision_matrix` dispatch chain so SPDE models can be passed via `latent=`. Move the kappa/tau extraction out of the driver and into a model method `assemble_Q(model, θ_block)`.
+- [ ] Stationary SPDE parity test on a fixed mesh & dataset against R-INLA's `inla.spde2.matern`.
+- [ ] `fbesag` (or a workable equivalent that R-INLA supports) for the non-stationary Brazil example. Parity test on example D.
+
+### Phase 4 — joint multi-likelihood
+
+Goal: example E (Baghfalaki).
+
+- [ ] Stacked likelihood support in `inla()`: `family::Vector{<:Likelihood}`, observation index → likelihood mapping.
+- [ ] `copy` linkage between linear predictors (a `CopyEffect` adapter that shares a latent slice across observation blocks with optional scaling β).
+- [ ] Weibull survival likelihood with shape hyperparameter.
+- [ ] Parity test on example E. Acceptance bar relaxed (R-INLA's joint model is a stress test): means within 10%, log-precisions within 0.1.
+
+### Phase 5 — perf parity
+
+Goal: warm wall time ≤ R-INLA `cpu.used["Total"]` on every example.
+
+- [ ] Profile cold vs warm with `BenchmarkTools.@btime` and `Profile`. Ensure `update_cache!` doesn't re-allocate on each call (prepare buffers once, in-place updates).
+- [ ] Cache the symbolic Cholesky factor (`SuiteSparse.CHOLMOD.symbolic_factor`); only refactorize numerically each step. R-INLA effectively does this and it dominates the speedup.
+- [ ] Cache `A'A` sparsity, the `Q` sparsity union, and the Takahashi pattern.
+- [ ] Run `bench/parity_bench.jl` and assert warm-Julia ≤ 2× R-INLA Total CPU on each fixture. Publish a perf table in the README with both numbers (and explicit Julia version + commit) — replacing the current "matches or exceeds R-INLA" claim with measured numbers.
+
+### Phase 6 — documentation
+
+- [ ] Replace `docs/make.jl` with a Documenter setup; add a tutorial page per example linking to the R-INLA reference page.
+- [ ] Update `README.md`: remove the broken examples; add the parity table from Phase 5; document supported models, priors, and limitations.
+- [ ] `dev/INLA*/PLAN.md`: convert to status documents reflecting what's done.
+
+## 5. R-INLA reference fixture pipeline
+
+A single script per example, deterministic, committed. Example shape:
+
+```r
+# examples/A_salamander/rinla.R
+suppressPackageStartupMessages({ library(INLA); library(jsonlite) })
+df <- read.csv("examples/A_salamander/data/salamander.csv", stringsAsFactors = TRUE)
+formula <- ...
+res <- inla(formula, data = df, family = "binomial", Ntrials = rep(1, nrow(df)),
+            control.compute = list(return.marginals = FALSE),
+            silent = 2L)
+ref <- list(
+  fixed = res$summary.fixed[, c("mean","sd","0.025quant","0.5quant","0.975quant")],
+  hyper = res$summary.hyperpar[, c("mean","sd","0.025quant","0.5quant","0.975quant")],
+  cpu = as.list(res$cpu.used),
+  inla_version = as.character(inla.version("version"))
+)
+write_json(ref, "examples/A_salamander/rinla_reference.json", pretty = TRUE, auto_unbox = TRUE)
+```
+
+Commit `rinla_reference.json`; rerun via `bench/Rrun.sh A_salamander` when R-INLA version pins change.
+
+## 6. What we're explicitly NOT doing in v1
+
+- Re-implementing R-INLA's full simplified-Laplace marginal correction. We accept Gaussian marginals where R-INLA also reports tight near-Gaussian posteriors; we flag deliberately when our marginals will diverge (e.g. very non-Gaussian Bernoulli posteriors at low n).
+- GPU parity. Metal/CUDA paths can stay as opt-in but are not in the success criteria. The README's GPU table must come down or be re-measured before any reinstatement.
+- Beating R-INLA. Parity (≤ 2×) is the bar.
+
+## 7. Working in this worktree
+
+- This worktree is on branch `worktree-inla-correctness-fix`.
+- One feature/phase per PR; each PR must keep the parity bench green for completed examples.
+- All R reference fixtures use INLA `25.10.19` (the version observed locally). Pin in CI via the `inla.version` string in the JSON.
+- Never commit changes that regress an existing parity test. If a fix is incompatible, update the JSON intentionally (with a commit message explaining the R-INLA version bump or methodology change).
+
+## 8. First concrete next step
+
+Before writing any production code: stand up Phase 0's `bench/Rrun.sh` and the salamander `rinla.R` script so we have a stable, machine-readable target to fix against. Without that, "matches R-INLA" is unfalsifiable.

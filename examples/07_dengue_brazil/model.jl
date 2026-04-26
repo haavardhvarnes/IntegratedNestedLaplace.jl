@@ -1,5 +1,6 @@
 using IntegratedNestedLaplace
 using DataFrames
+using Random
 using SparseArrays
 using LinearAlgebra
 using Distributions
@@ -8,10 +9,8 @@ using Unitful
 
 println("--- Example 07: Dengue in Brazil (Non-Stationary SPDE) ---")
 
-# 1. Generate Non-Stationary Spatial Data
-function get_brazil_data(n=50)
-    coords = [(rand(), rand()) for _ in 1:n]
-    # Spatially varying field
+function get_brazil_data(n=50; rng = MersenneTwister(20260426))
+    coords = [(rand(rng), rand(rng)) for _ in 1:n]
     y = [sin(c[1]*3) * exp(c[2]) for c in coords]
     df = DataFrame(y = y, loc_id = 1:n)
     return df, coords

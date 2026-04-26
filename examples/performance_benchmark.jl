@@ -1,14 +1,15 @@
 using IntegratedNestedLaplace
 using DataFrames
+using Random
 using SparseArrays
 using LinearAlgebra
 using Distributions
 using KernelAbstractions
 using Metal
 
-function get_large_data(n=250)
-    coords = [(rand(), rand()) for _ in 1:n]
-    y = [sin(c[1]*3) + cos(c[2]*3) + rand(Normal(0, 0.1)) for c in coords]
+function get_large_data(n=250; rng = MersenneTwister(20260426))
+    coords = [(rand(rng), rand(rng)) for _ in 1:n]
+    y = [sin(c[1]*3) + cos(c[2]*3) + rand(rng, Normal(0, 0.1)) for c in coords]
     df = DataFrame(y = y, loc_id = 1:n)
     return df, coords
 end
