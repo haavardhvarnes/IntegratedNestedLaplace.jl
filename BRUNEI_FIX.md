@@ -76,36 +76,77 @@ Cheap before expensive.
 
 ## Phasing
 
-### Phase 6a — diagnostic + (A)  *(~½ day)*
+### Phase 6a — diagnostic + (A)  ✅ landed; **does not fix Brunei**
 
-* [ ] `bench/brunei_obj_curve.jl` — evaluate `obj(θ)` and its components
-  (`ll`, `lp_correct`, `−0.5 log|H_c|`, `prior`) over a θ grid; print and
-  optionally save a CSV.  Verify the constraint stays satisfied at every θ.
-* [ ] In `src/IntegratedNestedLaplace.jl::laplace_eval`, switch the H branch
-  to the textbook form `log|H_c| = log|H| − log(A_c H⁻¹ A_c')`.  Q stays
-  on the augmented form (it's intrinsic).
-* [ ] Re-run the curve.  If the mode is now near θ ≈ 1.88: tighten
-  `test/parity/brunei_test.jl`, drop `@test_broken`, run all parity suites.
+* [x] `bench/brunei_obj_curve.jl` — prints `obj(θ)` and its components on
+  a θ grid for the Brunei model. Constraint satisfied at every θ
+  (`sum(u*) ~ 1e-15`).
+* [x] Switched the H branch of `laplace_eval` to the textbook form
+  `log|H_c| = log|H| − log(A_c H⁻¹ A_c')`. Mathematically correct for
+  full-rank H; the previous augmented form `log|H + A_c' A_c|` is only
+  correct for *singular* Q (Rue & Held 2005 eq. 2.30) and gives wrong
+  full-rank H values by `2 log s` where `s = A_c H⁻¹ A_c'`. No
+  regressions on Salamander, Bivariate, or SPDE parity suites.
+* [x] **Hypothesis falsified.** The two formulas differ by an *exact
+  constant* (Δ ≈ −21.3 nats ≈ `2 · log s` where `s ≈ 42 000`, dominated
+  by intercept-vs-area-constant unidentifiability under our N(0, 10³)
+  fixed-effect prior) across the entire θ grid. Both peak at τ → ∞.
+  The fix is a correctness improvement (right answer for `log p̂(y|θ)`
+  on intrinsic GMRF problems) but it doesn't move the optimum. Brunei
+  posterior parity stays `@test_broken`.
 
-### Phase 6b — (B) if (A) is insufficient  *(~1 day)*
+### Phase 6b — (B) IS correction  ✅ landed; **does not fix Brunei**
 
-* [ ] Add `_importance_correction(family, F_H, A_total, A_c, x*, η*, θ_y; N=100, rng)`
-  returning `log E_Gauss[exp(R(δ))]` where `R` is the Taylor remainder of
-  `log p(y|x* + δ)` beyond second order.  Sampling is on the constrained
-  subspace via `δ = L⁻ᵀ z − A_cᵀ (A_c L⁻ᵀ z)` with `z ~ N(0, I)`.
-* [ ] Wire into `laplace_eval` *replacing* the Phase-5 leading-Edgeworth
-  correction — IS subsumes it.
-* [ ] Confirm Brunei: per-area linear-predictor means agree with R-INLA
-  within `max(0.05, 0.20 × R-INLA SD)`; SDs within 30 % rtol; τ mean within
-  30 %.  Drop `@test_broken`.
-* [ ] Re-run salamander, bivariate, SPDE parity — no regression.
+* [x] `_importance_correction(family, A_total, F_H, x*, η*, θ_y, y_raw, o_vec, A_c; N=100, seed=…)`
+  returning `log E_{N_c(0,H_c⁻¹)}[exp(R(δ))]`. Samples `δ = F_H.UP \ z`
+  with `z ~ N(0, I)` (gives `δ ~ N(0, H⁻¹)`); projects to `ker(A_c)` for
+  constrained problems.
+* [x] Wired into `laplace_eval` after the constraint-corrected log-dets;
+  replaces the Phase-5 leading-Edgeworth (IS subsumes it).
+* [x] Deterministic seed for reproducibility. Try/catch fallback to 0.
+* [x] Salamander, Bivariate, SPDE parity all stay green (no regression).
+* [x] **Hypothesis falsified.** The IS correction is tiny across the
+  entire θ grid for Brunei: −0.073 nats at θ = −1, +0.001 at θ = 10. Far
+  too small to flip the 6-nat preference my Laplace gives to τ → ∞.
+  Brunei mode does not move (still τ ≈ 16 000); per-area LPs stay
+  collapsed at ≈ 0.115. `@test_broken` remains.
 
-### Phase 6c — only if A and B both fail
+### Diagnostic that surprised me — Brunei is broken even with **Gaussian** likelihood
 
-* [ ] Implement RMC09 §3.2.2 per-`xᵢ` simplified-Laplace marginal: for each
-  i, refit the Laplace conditional on `xᵢ` held at `x*ᵢ ± k σᵢ`, fit a
-  skew-normal to the resulting log-density values, recompute the marginal
-  mean/sd of `xᵢ` and the contribution to `log π̂(y|θ)`.
+A pure Gaussian-likelihood + Besag fit on the same data, where the
+Laplace approximation is *exact*, also shows a Julia/R-INLA τ
+disagreement (though much smaller):
+
+| Setup                          | Julia mode of log τ | R-INLA mode of log τ |
+| ---                            | ---:                | ---:                  |
+| Gaussian + besag (τ_y fixed)   | 1.23 (τ ≈ 3.4)      | 2.24 (τ ≈ 9.4)        |
+| Poisson + besag (default)      | 9.65 (τ ≈ 16 000)   | 1.32 (τ ≈ 3.7)        |
+
+The Gaussian gap is ~1 nat in log τ (factor 3 in τ). The Poisson gap is
+~8 nats (factor 4 000). So:
+
+1. There's a **structural disagreement** between my driver and R-INLA on
+   the constrained-Laplace marginal *even where the Laplace is exact*.
+   Small for Gaussian, compounds badly for non-Gaussian.
+2. It's **not in the higher-order corrections** — IS handles those.
+3. The likely culprit is somewhere in the constraint mechanics — possibly
+   how the prior contributes to `log p(x*|θ)` on the (n−k)-dim
+   constrained subspace, or how my mode-finder interacts with the
+   constraint. Worth a focused investigation pass.
+
+### Phase 6c — promoted
+
+* [ ] **6c.1 Diagnostic** *(~½ d)*: at a single fixed θ, dump
+  `(x*, log|Q_c|, log|H_c|, log p(y|x*), log p(x*|θ))` from Julia and
+  from an equivalent R-INLA call (same data, same θ, same constraint).
+  Identify which quantity disagrees and by how much. Tells us whether
+  the bug is in mode-finding, Hessian, log-determinant, likelihood
+  evaluation, or the prior contribution.
+* [ ] **6c.2 Strategy `laplace`** *(~3 d)*: implement R-INLA's full
+  per-`x_i` Laplace re-fit. Heavier but matches R-INLA's most accurate
+  code path.
+
+6c.1 must come before 6c.2.
 
 ## Acceptance criteria
 

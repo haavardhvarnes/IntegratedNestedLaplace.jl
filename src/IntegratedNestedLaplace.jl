@@ -11,6 +11,8 @@ using OptimizationOptimJL
 import Optimization
 import ADTypes
 using Printf
+using Random
+using Statistics
 using KernelAbstractions
 
 export inla, @formula, f
@@ -477,28 +479,29 @@ function inla(form::FormulaTerm, data;
         log_det_H = logdet(F_H)   # = log|H|, see sparse_logdet docstring
 
         # Constrained-determinant corrections. The Laplace approximation lives
-        # on the constrained subspace `{x : A_c x = 0}`. We use the Rue & Held
-        # (2005) eq. 2.30 form for *both* Q and H:
-        #     log|M_constrained| = log|M + A_c' A_c|
-        # This is the right thing for either matrix in our setting:
-        #   * `Q` is intrinsically rank-deficient along the null direction
-        #     (Besag/RW1/etc), so the naive `log|Q| − log(A_c Q⁻¹ A_c')`
-        #     diverges via the numerical ridge.
-        #   * `H = Q + Aᵀ D A` inherits the same near-null direction (the
-        #     data term has finite contribution along it but the τ-scaled Q
-        #     dominates), so `A_c H⁻¹ A_c'` is also dominated by `1/(τ·ε)`
-        #     for large τ and the standard formula over-counts by `2 log τ`.
-        # The augmented form uses sparse Cholesky on `M + A_c' A_c`, which is
-        # always well-conditioned by construction (`A_c' A_c` puts a unit
-        # eigenvalue in the otherwise near-null direction).
+        # on the constrained subspace `{x : A_c x = 0}`. The right log-det
+        # formula depends on whether the matrix is rank-deficient along
+        # row(A_c):
+        #   * For `Q` (intrinsic GMRF — Besag/RW1/etc — has row(A_c) in its
+        #     null space): use the Rue & Held 2005 eq. 2.30 augmented form
+        #     `log|Q_c| = log|Q + A_c' A_c|`. The standard
+        #     `log|Q| − log(A_c Q⁻¹ A_c')` form is undefined (Q is singular).
+        #   * For `H = Q + Aᵀ D A` (full rank thanks to the data term): use
+        #     the textbook form `log|H_c| = log|H| − log(A_c H⁻¹ A_c')`. The
+        #     augmented form `log|H + A_c' A_c|` gives a wrong (off by
+        #     `2 log s` where `s = A_c H⁻¹ A_c'`) result for full-rank H.
+        # Empirically these two formulas differed by ≈ −21 nats on Brunei,
+        # which is a constant shift (doesn't move the θ optimum) but is the
+        # mathematically correct answer.
         obj_main = try
             if has_constraints
                 AcT = sparse(A_constraint')
-                AcTAc = AcT * A_constraint
-                Q_aug = Q + AcTAc
-                H_aug = H + AcTAc
+                Q_aug = Q + AcT * A_constraint
                 log_det_Q_c = sparse_logdet(Q_aug)
-                log_det_H_c = sparse_logdet(H_aug)
+                # log|H_c| = log|H| − log(A_c H⁻¹ A_c')   (full-rank H form)
+                Wc = F_H \ Matrix(AcT)
+                S_h = Symmetric(Matrix(A_constraint * Wc))
+                log_det_H_c = log_det_H - logdet(S_h)
                 lp_correct = -0.5 * dot(x_star, Q * x_star) + 0.5 * log_det_Q_c
                 ll + lp_correct - 0.5 * log_det_H_c
             else
@@ -515,22 +518,24 @@ function inla(form::FormulaTerm, data;
             lprior += log_prior(effects[k].model, eff_slices[k])
         end
 
-        # Edgeworth-style correction to log π̂(y|θ). The Gaussian Laplace
-        # approximation rests on the second-order Taylor of `log p(y|x)` at x*;
-        # the next-order remainder picks up cubic and quartic terms in the
-        # latent deviation. To leading order:
-        #     correction = -⅛ ∑_k h⁽⁴⁾_k σ²²_k
-        #                  + ⅛ ∑_{k,l} h⁽³⁾_k h⁽³⁾_l σ²_k σ²_l Σ_(k,l)
-        #                  + ¹⁄₁₂ ∑_{k,l} h⁽³⁾_k h⁽³⁾_l Σ³_(k,l)
-        # Where Σ_(k,l) = (A H⁻¹ A')_(k,l) is the marginal η-covariance under
-        # the Gaussian Laplace, computed on the constrained subspace if
-        # `has_constraints`. Adds to `obj_main` (raises log-density).
-        # For Gaussian likelihoods the third and fourth derivatives are zero,
-        # so the correction vanishes — Gaussian Laplace is exact.
-        edgeworth_correction = _edgeworth_correction(family, A_total, F_H,
-                                                    eta_star, theta_y,
-                                                    has_constraints ? A_constraint : nothing)
-        obj_main += edgeworth_correction
+        # Importance-sampled correction to log π̂(y|θ). The Gaussian Laplace
+        # approximates the posterior `π(x|θ, y)` by `N(x*, H⁻¹)`; the true
+        # density carries the cubic and higher remainder
+        #   R(δ) = log p(y|x* + δ) − log p(y|x*) − grad·δ − ½ δ' (-A'D A) δ
+        # of the likelihood Taylor expansion at η* (the latent prior `p(x|θ)`
+        # is exactly Gaussian, contributing nothing to R for δ in ker(A_c)).
+        # We estimate
+        #   log p(y|θ) − log p̂_LA(y|θ) = log E_{N_c(0, H_c⁻¹)}[exp(R(δ))]
+        # by Monte Carlo with `N` samples drawn from N(0, H⁻¹) via
+        # `δ = F.UP \ z` and projected onto the constraint set.  Bernoulli
+        # has `R = O(δ³)`; Poisson has `R = O(δ³)` too. For Gaussian
+        # likelihoods R ≡ 0 — Laplace is exact and we skip the correction.
+        # Cost: `N` triangular solves + `N` likelihood evaluations per call.
+        is_correction = _importance_correction(family, A_total, F_H,
+                                               x_star, eta_star, theta_y,
+                                               y_raw, o_vec,
+                                               has_constraints ? A_constraint : nothing)
+        obj_main += is_correction
 
         obj = -(obj_main + lprior)
         return obj, x_star, F_H
@@ -541,6 +546,11 @@ function inla(form::FormulaTerm, data;
     Returns a Float64; for Gaussian likelihoods returns zero. Returns 0 if any
     intermediate quantity is non-finite (numerically degenerate near constraint
     boundaries for very large τ).
+
+    Kept around as a cheaper fallback / sanity check; the importance-sampled
+    correction in `_importance_correction` is preferred (captures all
+    higher-order terms, not just leading 4th-derivative + 3rd-derivative
+    cross-terms).
     """
     function _edgeworth_correction(family, A_total, F_H, eta_star, theta_y, A_c)
         family isa GaussianLikelihood && return 0.0
@@ -786,6 +796,73 @@ function _finitediff_hessian(f, x::AbstractVector{T}; eps_::T = T(1e-3)) where {
         end
     end
     return H
+end
+
+"""
+    _importance_correction(family, A_total, F_H, x_star, eta_star, theta_y,
+                           y_raw, o_vec, A_c; N=100, seed=0x42_42_42)
+
+Monte-Carlo estimate of `log E_{N_c(0, H_c⁻¹)}[exp(R(δ))]`, the correction
+the Gaussian Laplace approximation needs to recover the true `log p(y|θ)`.
+Returns a Float64; for Gaussian likelihoods returns 0 (Laplace is exact).
+On numerical failure returns 0 so BFGS doesn't see a non-finite obj.
+
+Sampling: `δ = F_H.UP \\ z` with `z ~ N(0, I)` gives `δ ~ N(0, H⁻¹)`. If a
+constraint `A_c` is supplied the sample is projected to `ker(A_c)` via
+`δ ← δ − H⁻¹ A_c' (A_c H⁻¹ A_c')⁻¹ A_c δ`. The resulting δ is a sample
+from `N(0, H_c⁻¹)` exactly.
+
+R(δ) = log p(y|η*+Aδ) − log p(y|η*) − grad'·(Aδ) − ½ (Aδ)' D (Aδ)
+     = the cubic-and-higher Taylor remainder of log p(y|·) at η*.
+
+The RNG is seeded *deterministically* so BFGS sees a reproducible
+objective (per-θ noise stable across calls).
+"""
+function _importance_correction(family, A_total, F_H, x_star, eta_star,
+                                theta_y, y_raw, o_vec, A_c;
+                                N::Int = 100, seed::UInt32 = UInt32(0x42_42_42))
+    family isa GaussianLikelihood && return 0.0
+    try
+        rng = MersenneTwister(seed)
+        n_latent = length(x_star)
+
+        grad_eta_raw, hess_eta_diag_raw = eta_derivatives(family, y_raw, theta_y)
+        grad_at = grad_eta_raw(eta_star)
+        hess_at = hess_eta_diag_raw(eta_star)
+        log_p_at_star = log_likelihood_total(family, y_raw, eta_star, theta_y)
+
+        have_c = A_c !== nothing && size(A_c, 1) > 0
+        local Wc, Sc_inv
+        if have_c
+            AcT = sparse(A_c')
+            Wc  = F_H \ Matrix(AcT)
+            Sc_inv = inv(Symmetric(Matrix(A_c * Wc)))
+        end
+
+        log_R = Vector{Float64}(undef, N)
+        for s in 1:N
+            z = randn(rng, n_latent)
+            δ = vec(F_H.UP \ z)
+            if have_c
+                δ -= vec(Wc * (Sc_inv * (A_c * δ)))
+            end
+            eta_dev = A_total * δ
+            eta_new = eta_star .+ eta_dev
+            log_p_new = log_likelihood_total(family, y_raw, eta_new, theta_y)
+            log_R[s] = log_p_new - log_p_at_star -
+                       dot(grad_at, eta_dev) -
+                       0.5 * sum(hess_at .* eta_dev .^ 2)
+            isfinite(log_R[s]) || (log_R[s] = -Inf)
+        end
+
+        log_R_max = maximum(log_R)
+        isfinite(log_R_max) || return 0.0
+        mean_exp = mean(exp.(log_R .- log_R_max))
+        mean_exp > 0 || return 0.0
+        return log_R_max + log(mean_exp)
+    catch
+        return 0.0
+    end
 end
 
 end # module
