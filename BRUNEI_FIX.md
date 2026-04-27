@@ -205,33 +205,117 @@ What this **does not** fix:
   `test/parity/brunei_test.jl` stays `@test_broken` on the per-area
   linear-predictor parity assertion.
 
-### Phase 6c.2 — Resolve the residual `log(A_c H⁻¹ A_c')` slope discrepancy
+### Phase 6c.2 — Refined diagnosis (the original 6c.2 hypothesis was misframed)
 
-Hypothesis: our `H = Q + A' D(−h_η) A` differs from R-INLA's joint posterior
-precision in how the (improper-prior) intercept couples with the
-constraint direction `A_c`. R-INLA uses `prec.intercept = 0` (a
-*genuinely* flat improper prior on the intercept, removed via an
-augmented system that effectively projects it out before the constrained
-Cholesky). We use `Q_fixed_block = 1e−3 · I`, a finite-precision
-substitute that puts a non-zero penalty on the intercept and then asks
-the constraint to absorb the difference.
+What we initially thought was a bug — that R-INLA's reported
+`log(A_c · cfg$Q⁻¹ · A_c')` varied with θ while ours was constant —
+turned out to compare *the wrong matrices*. R-INLA's `cfg$Q` is built
+on the GMRF graph pattern only, so the intercept (an isolated node in
+that graph) has all off-diagonal entries to the area block equal to
+zero. Specifically, for Brunei at fixed θ we observed `cfg$Q[β, β] = 126
+= sum(y)` but `cfg$Q[β, u_i] = 0` for all i — the *diagonal* data
+contribution is included but the *off-diagonal* one is dropped. So
+`cfg$Q ≠ Q_prior + Aᵀ D A`; it's neither the joint H nor the prior Q,
+but a graph-restricted partial. Verified by reading `Q[k++] =
+gmrf_approx->tab->Qfunc(...)` in
+`/tmp/r-inla/gmrflib/approx-inference--classic.c::4126–4132` — the loop
+iterates over `(ii, jj)` in `g->lnbs[ii]` (graph neighbours), not over
+the joint H sparsity pattern.
 
-* [ ] **6c.2.a Verify the hypothesis.** Run two variants of the dump:
-   one with `prec_intercept = 1e−3` (current Julia), one with
-   `prec_intercept = 0` (rebuild `Q_fixed_block` as the zero matrix on
-   the intercept block). If the τ-dependent slope of `log(A_c H⁻¹ A_c')`
-   reappears in the second variant and matches R-INLA, the hypothesis is
-   confirmed and the fix is to remove the `1e−3` finite-precision
-   substitute throughout the driver.
-* [ ] **6c.2.b Implement.** If 6c.2.a confirms, implement
-   `prec_intercept = 0` properly (it's an additional rank-1 augmentation
-   of the constraint: stack the fixed-effect column onto `A_total` with
-   a near-zero precision row in the augmented system, or equivalently
-   move the intercept's null-space contribution into the constraint
-   block). The mechanics already exist in `gmrf_newton_full` — only the
-   formulation in `inla()` and `laplace_eval` need to change.
-* [ ] **6c.2.c Drop `@test_broken`** once Brunei posterior-mean parity
-   matches the acceptance criteria below.
+The right scalar to compare against is **`res$mlik[1, 1]`** (R-INLA's
+marginal log-likelihood at fixed θ).  Across `θ ∈ {0, 1, 1.5, 1.88, 2,
+3, 5, 7, 10}`:
+
+| θ    | τ          | R-INLA mlik | Julia obj (current) |
+| ---: | ---:       | ---:        | ---:                |
+| 0    | 1.0        | −94.85      | 27.68               |
+| 1.5  | 4.5        | **−90.73**  | 36.33               |
+| 1.88 | 6.5        | −90.94      | 37.35               |
+| 3    | 20         | −92.99      | **38.48**           |
+| 5    | 148        | −96.60      | 37.85               |
+| 7    | 1097       | −97.61      | 37.56               |
+| 10   | 22 026     | −97.78      | 37.52               |
+
+The shapes mismatch in two ways:
+1. R-INLA's optimum is at θ ≈ 1.5; ours is at θ ≈ 3.
+2. R-INLA drops 7 nats from peak to θ = 10; we drop 1 nat. Our objective
+   is too flat in the right tail.
+
+### Real findings from reading R-INLA's source (`problem-setup.c::975–1053`)
+
+R-INLA's *exact* constrained-Gaussian-density formula at the mode is
+
+```
+sub_logdens = −½·n·log(2π) + ½·log|Q| − ½·(x*−μ)ᵀQ(x*−μ)
+              − ½·log|A·A'|                      (Jacobian of A)
+              + ½·n_c·log(2π)                    (degrees freed)
+              + ½·log|A·Q⁻¹·A'|                  (constrained density)
+              + ½·(Aμ−b)ᵀ(A·Q⁻¹·A')⁻¹·(Aμ−b)    (constraint mean term)
+```
+
+with the comment `[x|Ax] = [x] · [Ax|x] / [Ax]` (lines 1045–1049).
+The Q in this formula is the *posterior precision* (our H) when
+sub_logdens evaluates the Laplace-Gaussian density at x*.
+
+This implies the textbook identity:
+
+```
+log|H_c| = log|H| + log|A_c H⁻¹ A_c'|         (PLUS sign, normalized A_c)
+```
+
+Verified with a 2×2 toy: `H = diag(2, 3)`, `A = (1, 0)` (constraint
+`x_1 = 0`). True conditional precision in the e_2 direction is 3, so
+`log|H_c| = log 3`. The formula gives `log 6 + log(1/2) = log 3` ✓
+(our current code uses minus and gives `log 6 − log(1/2) = log 12` ✗).
+
+### Real bugs to fix in Phase 6c.2
+
+1. **Sign error in `laplace_eval`** at
+   [src/IntegratedNestedLaplace.jl:504](src/IntegratedNestedLaplace.jl):
+   ```julia
+   log_det_H_c = log_det_H - logdet(S_h)   # WRONG
+   log_det_H_c = log_det_H + logdet(S_h)   # CORRECT
+   ```
+   Phase 6a's switch to "textbook minus" was the wrong sign. **For Brunei
+   this only changes the constant offset** (log|A_c H⁻¹ A_c'| ≈ 10.65 is
+   ~θ-independent under our `prec_intercept = 1e−3` setup), so it doesn't
+   move the τ optimum. **It does** matter for any model with a θ-varying
+   `log|A_c H⁻¹ A_c'|`.
+
+2. **`prec_intercept = 0` improper-prior handling** is the actual
+   structural fix that moves Brunei's optimum.  R-INLA uses
+   `prec.intercept = 0`; we hard-code `Q_fixed_block = 1e−3·I`. The
+   1e−3 substitute makes the unidentifiable direction
+   `v = (e_β − ones_in_u_block)/√(n+1)` have a fixed (not τ-dependent)
+   eigenvalue in `H`, which clamps `log|A_c H⁻¹ A_c'|` to a
+   τ-independent constant. With `prec_intercept = 0`, that direction
+   has eigenvalue 0 in the prior Q — and the data contributes 0 to it
+   too because `A · v = 0` exactly — so `H` is rank-deficient by 1.
+   To handle this we must **augment the constraint matrix `A_c`** to
+   include the row `v_normalized` (or equivalently, do the standard
+   "improper prior → extra constraint" trick), bringing `n_c` from 1 to
+   2. Then the augmented `H + A_full' A_full` is full rank and the
+   `log|A_full · (H + A_full' A_full)⁻¹ · A_full'|` is well-defined.
+
+   Mechanically this means modifying `inla()` and `laplace_eval`:
+   * Detect intrinsic prior on the fixed effect (or expose
+     `prec_intercept` as a knob). When 0, append the unidentifiable
+     direction to the user constraint matrix.
+   * Newton step (`gmrf_newton_full`) already supports multi-row
+     constraints; only the `A_c` build site needs to change.
+   * Determinant corrections in `laplace_eval` use the augmented
+     `A_full`. The user-facing `log(A_c …)` reporting can stay on the
+     user constraint; the *internal* Laplace formula uses `A_full`.
+
+* [x] **6c.2.a Sign fix landed.** [src/IntegratedNestedLaplace.jl:504](src/IntegratedNestedLaplace.jl)
+   now uses `log_det_H + logdet(S_h)` (PLUS). Verified no regressions:
+   runtests 15/15, salamander 13/13, bivariate 10/10, SPDE 5/5,
+   Brunei 3 + 1 broken (sign change only shifts the obj by a constant
+   on Brunei since `log(A_c H⁻¹ A_c')` is θ-independent under our
+   `prec_intercept = 1e−3` setup).
+* [ ] **6c.2.b Implement improper-prior augmentation** (the real Brunei
+   fix — bigger task, touches `inla()` constraint build + the dumpers).
+* [ ] **6c.2.c Drop `@test_broken`** when Brunei matches acceptance criteria.
 
 ## Acceptance criteria
 
