@@ -171,14 +171,15 @@ struct BesagModel <: LatentModel
     end
 end
 
-# Returns the *multiplier* `c` such that `c · (D − W)` has geometric mean
-# marginal variance = 1 under the sum-to-zero-constrained ICAR prior.
-# This is what R-INLA's scale.model=TRUE applies to make τ interpretable as
-# an "average" precision across graphs.
+# Returns the multiplier `c` such that `Q_scaled = c · (D − W)` has
+# `geom_mean(diag(Σ_constrained)) = 1` (i.e. average marginal variance ≈ 1
+# under the sum-to-zero constraint). Equivalent to R-INLA's
+# `scale.model = TRUE`. With `Q_scaled = c · Q_unscaled`,
+# `Σ_scaled = (1/c) · Σ_unscaled`, so the desired multiplier is
+# `c = geom_mean(Σ_unscaled)`.
 #
-# Equals `1 / exp(mean(log(diag(Σ_unscaled_proj))))` where Σ_unscaled_proj
-# is the generalized inverse of (D−W) on the orthogonal complement of the
-# constant null direction.
+# (Earlier versions returned `1 / geom_mean`, which inverted the convention
+# and made R-INLA's `Qprior[i,i]` come out 3× smaller than ours on Brunei.)
 function _besag_scale_factor(W::SparseMatrixCSC{Float64, Int})
     n = size(W, 1)
     D = Matrix(spdiagm(0 => vec(sum(W, dims=2))))
@@ -189,8 +190,7 @@ function _besag_scale_factor(W::SparseMatrixCSC{Float64, Int})
     # back out, leaving the generalised inverse on the orthogonal complement.
     Σ = P * inv(Q0 + ones(n) * e') * P
     diag_var = real.(diag(Σ))
-    geom_mean = exp(mean(log.(max.(diag_var, 1e-12))))
-    return 1.0 / geom_mean
+    return exp(mean(log.(max.(diag_var, 1e-12))))
 end
 
 function precision_matrix(model::BesagModel, tau::T) where {T}
