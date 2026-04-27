@@ -97,6 +97,11 @@ function eval_at(theta_log_tau::Real, df, W)
     # obj_main using the textbook form for H (what 6a is testing).
     obj_main_text = ll + quad + 0.5 * log_det_Q_c_aug - 0.5 * log_det_H_c_text
 
+    # IS correction at this θ.
+    is_corr = IntegratedNestedLaplace._importance_correction(
+        PoissonLikelihood(), A_total, F_H, x_star, eta_star,
+        Float64[], df.y, o, A_c; N = 200)
+
     return (theta = theta_log_tau, tau = exp(theta_log_tau),
             x_intercept = x_star[1],
             sum_u   = sum(x_star[2:end]),
@@ -105,8 +110,10 @@ function eval_at(theta_log_tau::Real, df, W)
             log_det_Q_c = log_det_Q_c_aug,
             log_det_H_c_aug  = log_det_H_c_aug,
             log_det_H_c_text = log_det_H_c_text,
+            is_corr = is_corr,
             obj_aug  = -(obj_main_aug  + lprior),
-            obj_text = -(obj_main_text + lprior))
+            obj_text = -(obj_main_text + lprior),
+            obj_text_is = -(obj_main_text + is_corr + lprior))
 end
 
 function main()
@@ -127,11 +134,11 @@ function main()
     end
 
     println()
-    println("Compare obj_aug (current) vs obj_text (Phase 6a candidate):")
-    @printf("  %6s  %12s  %12s  %12s\n", "θ", "obj_aug", "obj_text", "Δ")
+    println("IS correction (Phase 6b):  log E[exp(R(δ))] at each θ")
+    @printf("  %6s  %12s  %12s  %12s\n", "θ", "obj_text", "is_corr", "obj_text_is")
     for θ in grid
         r = eval_at(θ, df, W)
-        @printf("  %6.2f  %12.4f  %12.4f  %12.4f\n", r.theta, r.obj_aug, r.obj_text, r.obj_text - r.obj_aug)
+        @printf("  %6.2f  %12.4f  %12.4f  %12.4f\n", r.theta, r.obj_text, r.is_corr, r.obj_text_is)
     end
 end
 
