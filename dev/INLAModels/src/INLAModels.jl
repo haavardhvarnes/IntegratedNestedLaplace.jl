@@ -64,7 +64,34 @@ function precision_matrix(::IIDModel, n::Int, tau::T) where T
     return tau * sparse(T(1.0) * I, n, n)
 end
 
-struct BivariateIIDModel <: LatentModel end
+"""
+    BivariateIIDModel(; a1=1.0, b1=5e-5, a2=1.0, b2=5e-5, rho_precision=1.0)
+
+Bivariate IID latent block: per pair `(u_i, v_i)`, the joint prior is
+2D Gaussian with precision matrix Σ⁻¹ parameterised by `(τ₁, τ₂, ρ)` where
+`τ₁ = 1/Var(u_i)`, `τ₂ = 1/Var(v_i)`, and `ρ = Corr(u_i, v_i)`.
+
+Prior on the (unconstrained) hyperparameters `(log τ₁, log τ₂, atanh ρ)`:
+* `log τ_j ~ logGamma(a_j, b_j)`  (R-INLA default a=1, b=5e-5)
+* `atanh ρ ~ N(0, 1/rho_precision)`  (R-INLA default precision 1)
+
+Matches R-INLA's `f(., model="2diid", param=c(a₁,b₁, a₂,b₂, 0, rho_precision))`.
+
+Latent layout is *interleaved* — `(u₁, v₁, u₂, v₂, …, u_n, v_n)`. The data
+must carry a `type ∈ {1, 2}` covariate selecting which slot each observation
+hits; the driver wires this in `_build_latent_effect`.
+"""
+struct BivariateIIDModel <: LatentModel
+    a1::Float64
+    b1::Float64
+    a2::Float64
+    b2::Float64
+    rho_precision::Float64
+end
+BivariateIIDModel(; a1::Real = 1.0, b1::Real = 5e-5,
+                    a2::Real = 1.0, b2::Real = 5e-5,
+                    rho_precision::Real = 1.0) =
+    BivariateIIDModel(Float64(a1), Float64(b1), Float64(a2), Float64(b2), Float64(rho_precision))
 
 function precision_matrix(::BivariateIIDModel, n_pairs::Int, tau1::T, tau2::T, rho::T) where T
     sigma1 = one(T)/sqrt(tau1)
@@ -313,11 +340,11 @@ function assemble_Q(model::BivariateIIDModel, theta_block::AbstractVector{T}, n:
     return precision_matrix(model, n_pairs, tau1, tau2, rho)
 end
 
-# Loose default: independent loggamma on the two precisions, weakly informative N(0,1) on z = atanh ρ.
-function log_prior(::BivariateIIDModel, theta_block::AbstractVector{T}) where {T}
-    return loggamma_logprior(theta_block[1]) +
-           loggamma_logprior(theta_block[2]) +
-           T(-0.5) * theta_block[3]^2
+# Independent log-Gamma on the two precisions, Gaussian on z = atanh ρ.
+function log_prior(m::BivariateIIDModel, theta_block::AbstractVector{T}) where {T}
+    return loggamma_logprior(theta_block[1]; a = m.a1, b = m.b1) +
+           loggamma_logprior(theta_block[2]; a = m.a2, b = m.b2) +
+           T(-0.5) * T(m.rho_precision) * theta_block[3]^2
 end
 
 # --- SPDEModel ---

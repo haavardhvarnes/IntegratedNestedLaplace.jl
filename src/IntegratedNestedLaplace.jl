@@ -221,7 +221,7 @@ function _build_latent_effect(t, data, n_obs, latent_override)
         latent_override isa BesagModel ?
             latent_override : error("formula uses f(., Besag) but latent= is not a BesagModel")
     elseif model_sym === :BivariateIID
-        BivariateIIDModel()
+        latent_override isa BivariateIIDModel ? latent_override : BivariateIIDModel()
     elseif model_sym === :RW1
         RW1Model()
     else

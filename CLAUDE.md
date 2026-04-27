@@ -241,6 +241,28 @@ What landed:
   produces an indefinite Q on small meshes.
 * **`fbesag` non-stationary Brazil parity**.
 
+### Phase 5b — Quick wins after the deep-Brunei rabbit hole  ✅ landed
+
+- [x] **#3 SPDE PD safety net + smoke parity test**. PosDef exceptions inside
+  `laplace_eval` now produce a smooth finite penalty (`1e8 + 1e3 ‖θ‖²`)
+  rather than `Inf`, so BFGS's finite-diff gradient stays usable. Multi-
+  start drops infeasible seeds. `x_warm` reset on entry if poisoned by a
+  previous failed eval. CCD nodes that fail are excluded from the mixture.
+  Swiss rainfall SPDE now runs end-to-end and reconstructs a synthetic
+  truth with RMSE 0.055 (noise SD = 0.1).
+- [x] **#2 Bivariate IID parity at strict tolerance**.
+  `BivariateIIDModel(; a1, b1, a2, b2, rho_precision)` exposes R-INLA's
+  `f(., model="2diid", param=c(...))` parameterization. Synthetic 30-study
+  bivariate fixture passes 10/10 — τ₁/τ₂ within 30 % rtol, ρ within 0.10
+  atol, latent posterior means within 0.10 RMSE.
+- [x] **#6 Perf benchmark + README perf table** at `bench/parity_bench.jl`.
+  Honest warm wall-time numbers vs R-INLA's `cpu.used["Total"]`:
+  Salamander 0.44× (2.3× faster), Bivariate 0.07× (14× faster),
+  Brunei 0.04× (24× faster), SPDE 2.4 s (no R-INLA fixture yet).
+- [x] **README.md** rewritten: stale "GPU 0.06 s" claims dropped, replaced
+  with the real perf table; status section honestly lists which parity
+  examples pass and which are `@test_broken`.
+
 ### Phase 5 — Edgeworth correction to `log π̂(y|θ)`  ✅ landed (insufficient for Brunei)
 
 What landed:
