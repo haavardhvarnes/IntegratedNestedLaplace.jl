@@ -76,16 +76,24 @@ Cheap before expensive.
 
 ## Phasing
 
-### Phase 6a — diagnostic + (A)  *(~½ day)*
+### Phase 6a — diagnostic + (A)  ✅ landed; **does not fix Brunei**
 
-* [ ] `bench/brunei_obj_curve.jl` — evaluate `obj(θ)` and its components
-  (`ll`, `lp_correct`, `−0.5 log|H_c|`, `prior`) over a θ grid; print and
-  optionally save a CSV.  Verify the constraint stays satisfied at every θ.
-* [ ] In `src/IntegratedNestedLaplace.jl::laplace_eval`, switch the H branch
-  to the textbook form `log|H_c| = log|H| − log(A_c H⁻¹ A_c')`.  Q stays
-  on the augmented form (it's intrinsic).
-* [ ] Re-run the curve.  If the mode is now near θ ≈ 1.88: tighten
-  `test/parity/brunei_test.jl`, drop `@test_broken`, run all parity suites.
+* [x] `bench/brunei_obj_curve.jl` — prints `obj(θ)` and its components on
+  a θ grid for the Brunei model. Constraint satisfied at every θ
+  (`sum(u*) ~ 1e-15`).
+* [x] Switched the H branch of `laplace_eval` to the textbook form
+  `log|H_c| = log|H| − log(A_c H⁻¹ A_c')`. Mathematically correct for
+  full-rank H; the previous augmented form `log|H + A_c' A_c|` is only
+  correct for *singular* Q (Rue & Held 2005 eq. 2.30) and gives wrong
+  full-rank H values by `2 log s` where `s = A_c H⁻¹ A_c'`. No
+  regressions on Salamander, Bivariate, or SPDE parity suites.
+* [x] **Hypothesis falsified.** The two formulas differ by an *exact
+  constant* (Δ ≈ −21.3 nats ≈ `2 · log s` where `s ≈ 42 000`, dominated
+  by intercept-vs-area-constant unidentifiability under our N(0, 10³)
+  fixed-effect prior) across the entire θ grid. Both peak at τ → ∞.
+  The fix is a correctness improvement (right answer for `log p̂(y|θ)`
+  on intrinsic GMRF problems) but it doesn't move the optimum. Brunei
+  posterior parity stays `@test_broken`.
 
 ### Phase 6b — (B) if (A) is insufficient  *(~1 day)*
 

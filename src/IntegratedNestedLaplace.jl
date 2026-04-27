@@ -477,28 +477,29 @@ function inla(form::FormulaTerm, data;
         log_det_H = logdet(F_H)   # = log|H|, see sparse_logdet docstring
 
         # Constrained-determinant corrections. The Laplace approximation lives
-        # on the constrained subspace `{x : A_c x = 0}`. We use the Rue & Held
-        # (2005) eq. 2.30 form for *both* Q and H:
-        #     log|M_constrained| = log|M + A_c' A_c|
-        # This is the right thing for either matrix in our setting:
-        #   * `Q` is intrinsically rank-deficient along the null direction
-        #     (Besag/RW1/etc), so the naive `log|Q| − log(A_c Q⁻¹ A_c')`
-        #     diverges via the numerical ridge.
-        #   * `H = Q + Aᵀ D A` inherits the same near-null direction (the
-        #     data term has finite contribution along it but the τ-scaled Q
-        #     dominates), so `A_c H⁻¹ A_c'` is also dominated by `1/(τ·ε)`
-        #     for large τ and the standard formula over-counts by `2 log τ`.
-        # The augmented form uses sparse Cholesky on `M + A_c' A_c`, which is
-        # always well-conditioned by construction (`A_c' A_c` puts a unit
-        # eigenvalue in the otherwise near-null direction).
+        # on the constrained subspace `{x : A_c x = 0}`. The right log-det
+        # formula depends on whether the matrix is rank-deficient along
+        # row(A_c):
+        #   * For `Q` (intrinsic GMRF — Besag/RW1/etc — has row(A_c) in its
+        #     null space): use the Rue & Held 2005 eq. 2.30 augmented form
+        #     `log|Q_c| = log|Q + A_c' A_c|`. The standard
+        #     `log|Q| − log(A_c Q⁻¹ A_c')` form is undefined (Q is singular).
+        #   * For `H = Q + Aᵀ D A` (full rank thanks to the data term): use
+        #     the textbook form `log|H_c| = log|H| − log(A_c H⁻¹ A_c')`. The
+        #     augmented form `log|H + A_c' A_c|` gives a wrong (off by
+        #     `2 log s` where `s = A_c H⁻¹ A_c'`) result for full-rank H.
+        # Empirically these two formulas differed by ≈ −21 nats on Brunei,
+        # which is a constant shift (doesn't move the θ optimum) but is the
+        # mathematically correct answer.
         obj_main = try
             if has_constraints
                 AcT = sparse(A_constraint')
-                AcTAc = AcT * A_constraint
-                Q_aug = Q + AcTAc
-                H_aug = H + AcTAc
+                Q_aug = Q + AcT * A_constraint
                 log_det_Q_c = sparse_logdet(Q_aug)
-                log_det_H_c = sparse_logdet(H_aug)
+                # log|H_c| = log|H| − log(A_c H⁻¹ A_c')   (full-rank H form)
+                Wc = F_H \ Matrix(AcT)
+                S_h = Symmetric(Matrix(A_constraint * Wc))
+                log_det_H_c = log_det_H - logdet(S_h)
                 lp_correct = -0.5 * dot(x_star, Q * x_star) + 0.5 * log_det_Q_c
                 ll + lp_correct - 0.5 * log_det_H_c
             else
