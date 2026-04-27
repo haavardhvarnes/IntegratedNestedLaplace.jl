@@ -189,40 +189,57 @@ Goal: integration over θ happens; bivariate models work.
   default applies a skewness correction. Implementing it tightens the
   fixed-effect parity tolerance from 10 % × SD to ~1 %.
 
-### Phase 3 — constrained models, simplified-Laplace, spatial parity
+### Phase 3 — constrained intrinsic models  ✅ landed (parity ⏳)
 
-Promoted into Phase 3:
+What landed:
 
-- [ ] **Hard sum-to-zero constraint** via the augmented (KKT) system in the
-  inner Newton. Required for Besag/ICAR/RW1/RW2/BYM/BYM2 to match R-INLA's
-  posterior. Implementation outline:
-  - Driver passes a constraint matrix `A_c` (k × n_latent) and target `e_c`.
-  - At each inner Newton iteration, solve the KKT system
-    `[H A_c'; A_c 0] [dx; λ] = [-g; e_c − A_c x]` instead of `H dx = -g`.
-  - The Cholesky factor of `H` is reused via Schur-complement updates; only
-    the `k × k` block changes per iteration. For k = 1 this is essentially
-    free.
-  - `log |H_constrained|` = `log |H| + log |A_c H⁻¹ A_c'|` (the Schur
-    complement). Update `laplace_obj` accordingly.
-- [ ] Promote `BesagModel`'s soft `constraint_precision` to expose
-  `hard_constraint = true` that hooks into the augmented-system path.
-- [ ] **Brunei parity test** (example C) using `BesagModel` with hard
-  sum-to-zero. Compare per-area linear-predictor mean and SD against R-INLA's
-  `summary.linear.predictor`. Acceptance: ≤ 5 % rtol on each.
-- [ ] **Simplified-Laplace marginal correction** (`strategy="simplified.laplace"`).
-  Implements the skewness correction at each latent coordinate using the
-  third-derivative of the log-likelihood at η*. Tightens fixed-effect parity
-  for non-Gaussian likelihoods.
-- [ ] Bivariate meta-analysis strict parity (example B). Implement Wishart
-  prior on the 2×2 precision via `f(study, BivariateIID)` with a new
-  `prior=:wishart` option matching R-INLA's `param=c(...)` convention.
-- [ ] Fix `precision_matrix` dispatch chain so SPDE models can be passed via
-  `latent=`. Move the kappa/tau extraction out of the driver and into a
-  model method `assemble_Q(model, θ_block)`.
-- [ ] Stationary SPDE parity test on a fixed mesh & dataset against R-INLA's
-  `inla.spde2.matern`.
-- [ ] `fbesag` (or a workable equivalent that R-INLA supports) for the
-  non-stationary Brazil example. Parity test on example D.
+- [x] **Hard sum-to-zero constraint** via the augmented (KKT) system in the
+  inner Newton. New `gmrf_newton_full(...; constraint_A=…)` solves
+  `[H A_c'; A_c 0] [dx; λ] = [-g; e_c − A_c x]` via Schur complement at every
+  iteration. The constraint is enforced exactly — Brunei's area effect sums
+  to zero to machine precision.
+- [x] **`constraint_matrix(model, n_block)` interface** in `INLAModels`.
+  `BesagModel` returns the normalized `1' / sqrt(n)` row; intrinsic models
+  inheriting this interface (RW1, ICAR, BYM2 in Phase 4) just override.
+- [x] **Determinant corrections in `laplace_eval`**: log-determinants on the
+  constrained subspace use `log|M + A_c' A_c|` (Rue & Held 2005, eq. 2.30)
+  for both `Q` and `H`. The standard `log|M| − log(A_c M⁻¹ A_c')` form
+  silently over-counts when `M` is near-singular along the constraint
+  direction (the Brunei pathology).
+- [x] **Canonical log-det scaling**. `sparse_logdet(Q)` and the matching
+  driver call previously each carried a stray ×2 factor that cancelled in
+  Phase 1 but disagreed once the constrained corrections came in.
+  Both call sites now use the single, canonical form.
+- [x] **Multi-start BFGS**. The Laplace objective is non-convex in θ for
+  IID precisions whose log-posterior is flat in tail regions; BFGS from a
+  single seed routinely gets trapped. Driver now seeds at the user's
+  `theta0`, plus `fill(5, n_h)` (near the log-Gamma prior mode) and
+  `fill(-2, n_h)` (the weak-shrinkage corner), and keeps the best.
+- [x] **Brunei R fixture + mechanics test**. Synthetic 42-area grid with rook
+  adjacency. Parity test confirms (a) the constraint is enforced
+  numerically, (b) the model dimensions are right, and (c) flags the
+  per-area linear-predictor parity as `@test_broken` until simplified-
+  Laplace lands.
+
+### What's still blocked — promoted to Phase 4
+
+* **Brunei posterior-mean parity (example C, the `@test_broken`)**. The Gaussian
+  Laplace `π̂(x | θ, y)` is an O(0.1×SD) approximation for sharply log-concave
+  likelihoods like Poisson on intrinsic GMRFs. The marginal posterior of θ
+  computed from this Gaussian Laplace has its global minimum at τ → ∞ where
+  R-INLA's marginal vanishes. The fix is the standard *simplified-Laplace*
+  skewness correction (third-derivative term at the mode), which R-INLA
+  applies by default. This is also what closes the residual mode-vs-mean
+  offset on Salamander Bernoulli fixed-effect posteriors.
+* **Bivariate meta-analysis strict parity (example B)**. Needs a Wishart
+  prior on the 2×2 precision matrix to match R-INLA's `2diid` default;
+  Julia's `BivariateIIDModel` currently only supports independent loggamma
+  priors on `(τ₁, τ₂, atanh ρ)`.
+* **SPDE PD fix + stationary parity**. The Phase 1 driver rewrite already
+  exposed the `precision_matrix(SPDEModel, ...)` dispatch hole; SPDE smoke
+  test in `test/runtests.jl` runs but the discretization in `INLASpatial`
+  produces an indefinite Q on small meshes.
+* **`fbesag` non-stationary Brazil parity**.
 
 ### Phase 4 — joint multi-likelihood
 

@@ -323,6 +323,25 @@ function inla(form::FormulaTerm, data;
     end
     A_total = hcat(A_blocks...)
 
+    # 4a. Assemble the global constraint matrix A_c (k_total × n_latent) by
+    # stacking each effect's per-block constraint, padded with zero columns
+    # for the fixed-effect prefix and the other effects.
+    constraint_blocks = SparseMatrixCSC{Float64,Int}[]
+    col_offset = n_fixed
+    for e in effects
+        Ac_local = constraint_matrix(e.model, e.n_block)
+        if size(Ac_local, 1) > 0
+            row = spzeros(size(Ac_local, 1), n_latent)
+            row[:, (col_offset + 1):(col_offset + e.n_block)] = Ac_local
+            push!(constraint_blocks, row)
+        end
+        col_offset += e.n_block
+    end
+    A_constraint = isempty(constraint_blocks) ?
+        spzeros(Float64, 0, n_latent) :
+        vcat(constraint_blocks...)
+    has_constraints = size(A_constraint, 1) > 0
+
     # 4b. Validate / normalize the offset.
     o_vec = if offset === nothing
         zeros(Float64, n_obs)
@@ -394,47 +413,101 @@ function inla(form::FormulaTerm, data;
         grad_eta_offset(eta) = grad_eta_raw(eta .+ o_vec)
         hess_eta_offset(eta) = hess_eta_diag_raw(eta .+ o_vec)
 
-        x_star = gmrf_newton_full(grad_eta_offset, hess_eta_offset, A_total, Q, x_warm)
+        x_star = gmrf_newton_full(grad_eta_offset, hess_eta_offset, A_total, Q, x_warm;
+                                  constraint_A = has_constraints ? A_constraint : nothing)
         copyto!(x_warm, x_star)
 
         eta_star = A_total * x_star .+ o_vec
         ll = log_likelihood_total(family, y_raw, eta_star, theta_y)
-        lp = -0.5 * dot(x_star, Q * x_star) + 0.5 * sparse_logdet(Q)
 
         h_eta = hess_eta_diag_raw(eta_star)
         H = Q + sparse(A_total' * spdiagm(0 => -h_eta) * A_total)
-        F = cholesky(Symmetric(H))
-        log_det_H = 2.0 * logdet(F)
+        F_H = cholesky(Symmetric(H))
+        log_det_H = logdet(F_H)   # = log|H|, see sparse_logdet docstring
+
+        # Constrained-determinant corrections. The Laplace approximation lives
+        # on the constrained subspace `{x : A_c x = 0}`. We use the Rue & Held
+        # (2005) eq. 2.30 form for *both* Q and H:
+        #     log|M_constrained| = log|M + A_c' A_c|
+        # This is the right thing for either matrix in our setting:
+        #   * `Q` is intrinsically rank-deficient along the null direction
+        #     (Besag/RW1/etc), so the naive `log|Q| − log(A_c Q⁻¹ A_c')`
+        #     diverges via the numerical ridge.
+        #   * `H = Q + Aᵀ D A` inherits the same near-null direction (the
+        #     data term has finite contribution along it but the τ-scaled Q
+        #     dominates), so `A_c H⁻¹ A_c'` is also dominated by `1/(τ·ε)`
+        #     for large τ and the standard formula over-counts by `2 log τ`.
+        # The augmented form uses sparse Cholesky on `M + A_c' A_c`, which is
+        # always well-conditioned by construction (`A_c' A_c` puts a unit
+        # eigenvalue in the otherwise near-null direction).
+        if has_constraints
+            AcT = sparse(A_constraint')
+            AcTAc = AcT * A_constraint
+            Q_aug = Q + AcTAc
+            H_aug = H + AcTAc
+            log_det_Q_c = sparse_logdet(Q_aug)
+            log_det_H_c = sparse_logdet(H_aug)
+            lp_correct = -0.5 * dot(x_star, Q * x_star) + 0.5 * log_det_Q_c
+            obj_main = ll + lp_correct - 0.5 * log_det_H_c
+        else
+            lp = -0.5 * dot(x_star, Q * x_star) + 0.5 * sparse_logdet(Q)
+            obj_main = ll + lp - 0.5 * log_det_H
+        end
 
         lprior = log_prior(family, theta_y)
         for k in eachindex(effects)
             lprior += log_prior(effects[k].model, eff_slices[k])
         end
 
-        # Minimise the negative log marginal posterior of θ.
-        obj = -(ll + lp - 0.5 * log_det_H + lprior)
-        return obj, x_star, F
+        obj = -(obj_main + lprior)
+        return obj, x_star, F_H
     end
 
     laplace_obj(theta) = first(laplace_eval(theta))
 
-    # 9. Optimize. For Phase 1 we use BFGS with finite-diff gradients. The
-    # closed-form analytic gradient is a Phase 2/3 milestone; finite diff with
-    # n_h ≤ 10 is acceptable runtime overhead.
+    # 9. Optimize. BFGS with finite-diff gradients. The Laplace objective is
+    # generally non-convex in θ — it has multiple local minima for IID
+    # precisions whose log-posterior is flat in tail regions (Salamander is
+    # the canonical example). To avoid getting trapped, we run BFGS from
+    # several seed θ values: the user-provided `theta0`, a high-precision
+    # corner (`theta0 .+ 5`, near the log-Gamma prior mode at log τ ≈ 9.9),
+    # and a low-precision corner (`theta0 .- 5`). Whichever attains the
+    # smallest objective wins.
     optf = Optimization.OptimizationFunction((th, _p) -> laplace_obj(th),
                                              ADTypes.AutoFiniteDiff())
-    prob = Optimization.OptimizationProblem(optf, theta_init)
-
     inner_solver = solver === :bfgs        ? BFGS()        :
                    solver === :neldermead  ? NelderMead()  :
                    solver === :newton      ? Newton()      :
                    error("unknown solver $(solver). Use :bfgs, :neldermead, or :newton.")
 
-    sol = Optimization.solve(prob, inner_solver;
-                             maxiters = max_outer_iter,
-                             abstol   = 1e-7,
-                             reltol   = 1e-7)
-    theta_star = collect(sol.u)
+    seeds = [theta_init]
+    if n_h > 0
+        # Default seeds bracket the typical posterior region for log-precision:
+        # one near the log-Gamma prior mode (~log 20000), one in the
+        # weak-shrinkage corner. The user's `theta0` (or zeros) remains the
+        # primary seed; the others guard against local minima.
+        push!(seeds, fill(5.0, n_h))
+        push!(seeds, fill(-2.0, n_h))
+    end
+
+    best_theta = theta_init
+    best_obj   = Inf
+    for seed in seeds
+        prob = Optimization.OptimizationProblem(optf, seed)
+        try
+            sol = Optimization.solve(prob, inner_solver;
+                                     maxiters = max_outer_iter,
+                                     abstol = 1e-7, reltol = 1e-7)
+            v = laplace_obj(collect(sol.u))
+            if v < best_obj
+                best_obj = v
+                best_theta = collect(sol.u)
+            end
+        catch
+            # one bad seed shouldn't kill the whole call
+        end
+    end
+    theta_star = best_theta
 
     # 10. CCD integration over θ.
     # The CCD pass is what turns Julia's joint-mode estimator into a posterior

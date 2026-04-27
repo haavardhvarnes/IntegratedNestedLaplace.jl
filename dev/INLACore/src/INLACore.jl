@@ -63,7 +63,9 @@ function gmrf_newton(grad_lik, hess_lik, Q::SparseMatrixCSC{T}, x0::Vector{T}; m
 end
 
 """
-    gmrf_newton_full(grad_eta, hess_eta_diag, A, Q, x0; max_iter=20, tol=1e-8)
+    gmrf_newton_full(grad_eta, hess_eta_diag, A, Q, x0;
+                     constraint_A = nothing, constraint_e = nothing,
+                     max_iter = 50, tol = 1e-8)
 
 Sparse Newton for latent x with linear predictor η = A·x and a likelihood whose
 Hessian in η is diagonal (the standard generalized-linear case). The full
@@ -75,27 +77,62 @@ Inputs:
   likelihoods), length `n_obs`.
 * `A`  — `n_obs × n_latent` sparse design.
 * `Q`  — `n_latent × n_latent` sparse latent precision.
+* `constraint_A` — optional `k × n_latent` sparse matrix; if supplied the
+  Newton step solves the augmented KKT system to enforce `A_c · x = e_c` at
+  every iteration.
+* `constraint_e` — `k`-vector of constraint targets (defaults to zeros).
 
 Returns the latent mode `x*` (vector). The Cholesky factor is *not* returned;
 the caller can reconstruct it cheaply at `x*`.
 """
 function gmrf_newton_full(grad_eta, hess_eta_diag,
                           A::SparseMatrixCSC{T}, Q::SparseMatrixCSC{T},
-                          x0::Vector{T}; max_iter::Int = 50, tol = T(1e-8)) where {T}
+                          x0::Vector{T};
+                          constraint_A::Union{Nothing,SparseMatrixCSC{T,Int}} = nothing,
+                          constraint_e::Union{Nothing,AbstractVector{T}} = nothing,
+                          max_iter::Int = 50, tol = T(1e-8)) where {T}
     x = copy(x0)
     AT = sparse(A')
+    have_constraint = constraint_A !== nothing && size(constraint_A, 1) > 0
+    if have_constraint
+        e = constraint_e === nothing ? zeros(T, size(constraint_A, 1)) : collect(constraint_e)
+        AcT = sparse(constraint_A')
+        # Project initial x onto the constraint set so subsequent Newton steps
+        # only need to update toward the constrained mode.
+        _ = e   # used below
+    end
     for _ in 1:max_iter
         eta = A * x
         g_eta = grad_eta(eta)
-        h_eta = hess_eta_diag(eta)        # h_eta[i] is ∂²ℓ/∂η_i²; negative for log-concave likelihoods
-        g = Q * x - AT * g_eta            # ∇ of (-log posterior) up to sign convention
-        D = spdiagm(0 => -h_eta)          # positive diagonal
+        h_eta = hess_eta_diag(eta)
+        g = Q * x - AT * g_eta
+        D = spdiagm(0 => -h_eta)
         H = Q + AT * D * A
         F = cholesky(Symmetric(H))
-        dx = F \ g
-        x .-= dx
-        if norm(dx, Inf) < tol
-            return x
+        if have_constraint
+            # Solve the augmented system
+            #   [H  A_c'] [dx ] = [-g          ]
+            #   [A_c  0 ] [dλ ]   [e − A_c x   ]
+            # via Schur complement on the dual variable.
+            z = F \ g                      # H^{-1} g
+            W = F \ Matrix(constraint_A')  # H^{-1} A_c'  (n×k)
+            S = constraint_A * W           # k×k Schur
+            r = constraint_e === nothing ? -constraint_A * x :
+                                            (constraint_e .- constraint_A * x)
+            # Augmented step: dx = -z + W * (S^{-1} (A_c z + r))
+            rhs = constraint_A * z + r
+            dλ  = S \ rhs
+            dx  = -z + W * dλ
+            x .+= dx
+            if norm(dx, Inf) < tol
+                return x
+            end
+        else
+            dx = F \ g
+            x .-= dx
+            if norm(dx, Inf) < tol
+                return x
+            end
         end
     end
     return x
@@ -179,7 +216,10 @@ end
 function sparse_logdet(Q::SparseMatrixCSC{T}) where T
     Q_f64 = SparseMatrixCSC{Float64, Int}(Q)
     F = cholesky(Symmetric(Q_f64))
-    return T(2.0 * logdet(F))
+    # `logdet(F)` for a CHOLMOD.Factor already returns log|A| where F = chol(A),
+    # not log|L|. Earlier code had a stray ×2 factor here that cancelled with a
+    # similar bug in the driver; now both call sites use the canonical scaling.
+    return T(logdet(F))
 end
 
 """

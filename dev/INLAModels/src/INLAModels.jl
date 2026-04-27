@@ -11,6 +11,7 @@ export LatentModel, AR1Model, RW1Model, IIDModel, SPDEModel, BivariateIIDModel, 
 export BesagModel
 export PCPrior, log_pdf, precision_matrix
 export n_hyper, assemble_Q, log_prior, has_likelihood_hyperparameter
+export constraint_matrix, has_constraint
 
 # --- Priors ---
 
@@ -118,34 +119,28 @@ struct ICARModel <: LatentModel
 end
 
 """
-    BesagModel(W; scale=true, constraint_precision=1e6)
+    BesagModel(W; scale=true)
 
 Besag/CAR model on the area adjacency graph encoded by symmetric sparse `W`.
 Equivalent to R-INLA's `f(., model="besag", graph=g, scale.model=true/false)`.
 
+The sum-to-zero constraint `1' u = 0` is enforced *exactly* via the augmented
+KKT system in the driver's inner Newton step and via determinant corrections
+in the Laplace marginal likelihood. Without the constraint the area effect
+and the intercept are jointly unidentified — a nuisance for `summary.fixed`
+and a real problem for the Laplace approximation, which would otherwise
+prefer `τ → ∞` (u → 0, intercept absorbs everything).
+
 * `scale=true` (default) rescales the unscaled precision `Q₀ = D − W` so the
   geometric mean of marginal variances under the constrained ICAR prior is 1.
   This is what R-INLA's `scale.model=TRUE` does.
-* `constraint_precision=1e6` enforces a soft sum-to-zero constraint on the
-  area effect by adding `κ · 1·1'` to the precision before scaling by τ.
-  Without this constraint, an intercept term in the model would be unidentified
-  against a constant shift in the area effect, producing nonsensically tight
-  posterior precisions on τ. R-INLA imposes the constraint *exactly*; the soft
-  version is a Phase 2 approximation that is tight enough to match R-INLA's
-  posterior for moderately strong κ. A hard constraint via the augmented
-  system is on the Phase 3 to-do list.
 """
 struct BesagModel <: LatentModel
     W::SparseMatrixCSC{Float64, Int}
     scale::Bool
     scale_factor::Float64
-    constraint_precision::Float64
-    function BesagModel(W::SparseMatrixCSC{Float64, Int};
-                        scale::Bool = true,
-                        constraint_precision::Real = 1e6)
-        return new(W, scale,
-                   scale ? _besag_scale_factor(W) : 1.0,
-                   Float64(constraint_precision))
+    function BesagModel(W::SparseMatrixCSC{Float64, Int}; scale::Bool = true)
+        return new(W, scale, scale ? _besag_scale_factor(W) : 1.0)
     end
 end
 
@@ -172,22 +167,21 @@ function _besag_scale_factor(W::SparseMatrixCSC{Float64, Int})
 end
 
 function precision_matrix(model::BesagModel, tau::T) where {T}
-    n = size(model.W, 1)
     W = sparse(T.(model.W))
     D = spdiagm(0 => vec(sum(W, dims=2)))
     Q = (D - W) .* T(model.scale_factor)
-    # Soft sum-to-zero: add κ · 1·1' so the constant null direction picks up a
-    # large precision, eliminating identifiability ambiguity with the intercept.
-    if model.constraint_precision > 0
-        κ = T(model.constraint_precision)
-        # Symmetric rank-1 update — keeps result sparse only conceptually.
-        # For modest n this is fine; large-graph version uses augmented system.
-        Q = Q + κ .* sparse(ones(T, n, n))
-    end
-    @inbounds for i in 1:n
-        Q[i, i] += T(1e-9)
-    end
+    # Q is intrinsically rank-deficient along the constant null direction.
+    # We do *not* add a numerical jitter here: the driver augments Q with the
+    # `A_c' A_c` rank-1 update from the sum-to-zero constraint when computing
+    # log-determinants, and adds `Aᵀ D A` (positive) when forming H. Both
+    # provide enough mass along the null direction that Cholesky never sees
+    # the rank deficiency.
     return tau * Q
+end
+
+function constraint_matrix(::BesagModel, n_block::Int)
+    # 1×n: the sum-to-zero constraint 1' u = 0, normalized so A_c A_c' = 1.
+    return sparse(ones(1, n_block) ./ sqrt(n_block))
 end
 
 n_hyper(::BesagModel) = 1
@@ -248,6 +242,13 @@ end
 # Default: zero hypers.
 n_hyper(::Any) = 0
 log_prior(::Any, theta_block::AbstractVector) = zero(eltype(theta_block))
+
+# Default: no linear constraints. Intrinsic GMRFs (RW1/RW2/Besag/ICAR/BYM/BYM2)
+# override `constraint_matrix(model, n_block)` to return a `k × n_block` sparse
+# matrix `A_c` so that `A_c · u = 0` is enforced exactly inside the Laplace
+# approximation (via the augmented KKT system in the inner Newton, plus
+# determinant corrections −½ log det(A_c Σ A_c') in the marginal likelihood).
+constraint_matrix(::Any, n_block::Int) = spzeros(0, n_block)
 
 # --- Default log-Gamma(1, 5e-5) prior on log-precision (R-INLA's default). ---
 const _LGAMMA_A_DEFAULT = 1.0
