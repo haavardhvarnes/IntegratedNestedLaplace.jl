@@ -140,6 +140,23 @@ function eta_derivatives(::PoissonLikelihood, y, _theta_y)
     return grad_eta, hess_eta_diag
 end
 
+# --- Third derivative of log p(y_k|η_k) wrt η_k, evaluated at η. ---
+#
+# Used by the simplified-Laplace marginal-mean correction. Returns a vector of
+# length `n_obs`. For Gaussian the third derivative is identically zero, so
+# the SLA correction is also zero — Gaussian Laplace is already exact.
+
+third_deriv_eta(::GaussianLikelihood, eta, _theta_y) = zeros(eltype(eta), length(eta))
+
+function third_deriv_eta(::BernoulliLikelihood, eta, _theta_y)
+    p = inv.(one.(eta) .+ exp.(.-eta))
+    return .-p .* (one.(p) .- p) .* (one.(p) .- 2 .* p)
+end
+
+function third_deriv_eta(::PoissonLikelihood, eta, _theta_y)
+    return .-exp.(eta)
+end
+
 # --- log p(y | η, θ_y) summed over observations. ---
 
 function log_likelihood_total(::GaussianLikelihood, y, eta, theta_y)
@@ -533,17 +550,49 @@ function inla(form::FormulaTerm, data;
     nodes = integration_nodes(theta_star, Matrix(H_theta))
 
     # Evaluate the posterior at each node, store (x_k, var_k, obj_k).
+    # Also apply the simplified-Laplace marginal-mean correction for x:
+    #   E_SLA[x_i | y, θ] = x*_i + ½ (H⁻¹ A')_(i,k) · h⁽³⁾(η*_k) · σ²_(η_k)
+    # vector form: Δx = ½ H⁻¹ Aᵀ · diag(h⁽³⁾) · diag(σ²_η) · 1_{n_obs}
+    #            = ½ H⁻¹ Aᵀ (h⁽³⁾ ⊙ σ²_η)
+    # σ²_(η_k) = (A H⁻¹ Aᵀ)_(k,k) is computed from the joint solve `H⁻¹ Aᵀ`.
+    # For Gaussian likelihoods h⁽³⁾ ≡ 0, so the SLA correction vanishes.
     n_nodes  = length(nodes)
     obj_at   = Vector{Float64}(undef, n_nodes)
     x_at     = Vector{Vector{Float64}}(undef, n_nodes)
     var_at   = Vector{Vector{Float64}}(undef, n_nodes)
+    has_sla  = has_likelihood_hyperparameter(family) === false &&
+               !(family isa GaussianLikelihood)
     for k in 1:n_nodes
-        # Reset warm start to the global mode each time so neighbouring CCD
-        # nodes don't pollute the inner Newton with stale state.
         copyto!(x_warm, x_star)
         obj_k, x_k, F_k = laplace_eval(nodes[k])
         obj_at[k] = obj_k
-        x_at[k]   = x_k
+
+        if has_sla
+            theta_y_k, _ = _slices(nodes[k])
+            eta_k = A_total * x_k .+ o_vec
+            h3 = third_deriv_eta(family, eta_k, theta_y_k)
+            # σ²_(η_k) per observation = diag(A H⁻¹ Aᵀ).
+            # Solve H · Z = Aᵀ once (n_obs RHS); σ²_η = colwise(A · Z).
+            AT = sparse(A_total')
+            Z  = F_k \ Matrix(AT)            # n_latent × n_obs
+            sigma2_eta = vec(sum(A_total .* Z', dims = 2))
+            v_obs = h3 .* sigma2_eta         # length n_obs
+            Av = A_total' * v_obs            # length n_latent
+            delta_x = 0.5 .* (F_k \ Av)
+            # The SLA correction uses the unconstrained Σ = H⁻¹. Project the
+            # shift back onto the constraint set so `x* + Δx` still satisfies
+            # A_c x = 0 (Δx_c = Δx − A_cᵀ (A_c A_cᵀ)⁻¹ A_c Δx). For our
+            # normalized constraint A_c A_cᵀ = I, so the projection is just a
+            # rank-k subtraction.
+            if has_constraints
+                violation = A_constraint * delta_x
+                # k×k Schur (=I for normalized A_c) → just subtract Aᵀ violation
+                delta_x .-= A_constraint' * violation
+            end
+            x_at[k] = x_k .+ delta_x
+        else
+            x_at[k] = x_k
+        end
         var_at[k] = takahashi_diag(F_k)
     end
 

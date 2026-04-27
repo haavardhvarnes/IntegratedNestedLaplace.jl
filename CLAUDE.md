@@ -241,14 +241,44 @@ What landed:
   produces an indefinite Q on small meshes.
 * **`fbesag` non-stationary Brazil parity**.
 
-### Phase 4 — joint multi-likelihood
+### Phase 4 — simplified-Laplace marginal-mean correction  ✅ landed (Salamander)
 
-Goal: example E (Baghfalaki).
+What landed:
 
-- [ ] Stacked likelihood support in `inla()`: `family::Vector{<:Likelihood}`, observation index → likelihood mapping.
-- [ ] `copy` linkage between linear predictors (a `CopyEffect` adapter that shares a latent slice across observation blocks with optional scaling β).
-- [ ] Weibull survival likelihood with shape hyperparameter.
-- [ ] Parity test on example E. Acceptance bar relaxed (R-INLA's joint model is a stress test): means within 10%, log-precisions within 0.1.
+- [x] **`third_deriv_eta(family, η, θ_y)`** dispatch on each likelihood:
+  Bernoulli `−p(1−p)(1−2p)`, Poisson `−exp(η)`, Gaussian zero (Laplace
+  is exact, no correction needed).
+- [x] **SLA correction inside the CCD loop**. At every CCD node `θ_k`:
+  ```
+  σ²_η = diag(A H⁻¹ Aᵀ)                          # via one CHOLMOD solve
+  Δx = ½ · H⁻¹ Aᵀ · (h⁽³⁾(η*) ⊙ σ²_η)
+  ```
+  Then project `Δx` back onto the constraint set when
+  `has_constraints` (otherwise the SLA correction would re-introduce
+  sum-to-zero violations on intrinsic GMRFs). Mixture mean uses
+  `x*_k + Δx_proj_k` weighted by the existing CCD weights.
+- [x] **Salamander parity at strict tolerance (1 % × R-INLA SD)**.
+  Posterior means on every fixed effect now match R-INLA to 5 decimal
+  places (largest diff = 0.00035 × SD on `CrossW/R`). Warm wall 0.44 s
+  vs R-INLA cpu.used 2.09 s (4.7× faster).
+
+### What's still blocked — promoted to Phase 5
+
+* **Brunei marginal-of-θ pathology (the `@test_broken`)**. The SLA mean
+  correction on `x | θ` doesn't fix the τ → ∞ drift in `log π̂(θ|y)` itself.
+  That correction needs the higher-order Laplace expansion (Edgeworth-style
+  4th-derivative + 3rd-derivative cross-terms in `log π̂(y|θ)`, RMC09 eq. 3.4)
+  or R-INLA's `strategy="laplace"` (full Laplace at each θ, expensive). For
+  intrinsic GMRFs with low-information data, this is the real fix. Implementing
+  it raises the same machinery as full Laplace and is best done together with
+  the variance correction.
+* **Bivariate meta-analysis strict parity (example B)** — Wishart prior on
+  the 2×2 precision matrix.
+* **SPDE PD fix + stationary parity**.
+* **`fbesag` non-stationary Brazil parity**.
+* **Joint multi-likelihood (example E)** — stacked `family::Vector{<:Likelihood}`,
+  per-observation likelihood routing, `CopyEffect` adapter, Weibull likelihood
+  with shape hyper.
 
 ### Phase 5 — perf parity
 

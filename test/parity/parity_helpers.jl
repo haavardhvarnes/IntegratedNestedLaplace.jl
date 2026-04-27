@@ -33,20 +33,18 @@ hyper_mean(ref, name) = ref["hyper"][name]["mean"]
 hyper_sd(ref, name)   = ref["hyper"][name]["sd"]
 
 """
-    assert_fixed(ref, term, julia_mean, julia_sd; mean_atol_factor=0.10, sd_rtol=0.10, mean_floor=1e-3)
+    assert_fixed(ref, term, julia_mean, julia_sd; mean_atol_factor=0.01, sd_rtol=0.05, mean_floor=1e-3)
 
 Assert agreement of a fixed-effect summary against R-INLA. The mean tolerance is
 `max(mean_floor, mean_atol_factor × R-INLA SD)`. SD tolerance is relative.
 
-Phase 2 default (after CCD integration over θ) is 10 % of R-INLA SD. CCD covers
-the integration over θ, but the Gaussian Laplace approximation of `π(x|y,θ)`
-still underestimates the marginal posterior mean for skewed likelihoods like
-Bernoulli (typically by O(0.1 × SD) on a single coordinate). The simplified-
-Laplace skewness correction lands in Phase 3 and tightens this to ~1 % of SD.
+After Phase 4 (CCD integration over θ + simplified-Laplace marginal-mean
+correction for non-Gaussian likelihoods), the mean tolerance is back to the
+plan's 1 % of R-INLA SD bar.
 """
 function assert_fixed(ref, term, julia_mean, julia_sd;
-                      mean_atol_factor = 0.10,
-                      sd_rtol          = 0.10,
+                      mean_atol_factor = 0.01,
+                      sd_rtol          = 0.05,
                       mean_floor       = 1e-3)
     rmean = fixed_mean(ref, term)
     rsd   = fixed_sd(ref, term)
