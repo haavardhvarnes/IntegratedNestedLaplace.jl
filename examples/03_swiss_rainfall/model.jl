@@ -1,14 +1,13 @@
 using IntegratedNestedLaplace
 using DataFrames
+using Random
 using SparseArrays
 using LinearAlgebra
 using Distributions
 using Plots
 
-# 1. Mock Swiss Rainfall Data
-function get_swiss_data(n=100)
-    coords = [(rand(), rand()) for _ in 1:n]
-    # Smooth spatial signal
+function get_swiss_data(n=100; rng = MersenneTwister(20260426))
+    coords = [(rand(rng), rand(rng)) for _ in 1:n]
     y = [sin(c[1]*3) + cos(c[2]*3) for c in coords]
     df = DataFrame(y = y, loc_id = 1:n)
     return df, coords
@@ -22,10 +21,10 @@ mesh = build_mesh(coords)
 C, G = spde_matrices(mesh)
 spde = SPDEModel(C, G)
 
-# 3. Run INLA with a fixed hyper-starting point for stability
+# 3. Run INLA. With Gaussian likelihood there are now 3 hyperparameters:
+#    [log τ_y, log κ, log τ_spde].
 println("Running IntegratedNestedLaplace.jl...")
-# Start at more reasonable log-parameters [log(kappa), log(tau)]
-res = inla(@formula(y ~ f(loc_id, SPDE)), data, latent=spde, theta0=[1.0, 2.0])
+res = inla(@formula(y ~ f(loc_id, SPDE)), data, latent=spde, theta0=[2.0, 1.0, 2.0])
 
 println(res)
 

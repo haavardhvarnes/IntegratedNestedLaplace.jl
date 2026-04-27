@@ -1,125 +1,173 @@
 # IntegratedNestedLaplace.jl
 
-`IntegratedNestedLaplace.jl` is a native Julia implementation of the Integrated Nested Laplace Approximation (INLA) methodology for approximate Bayesian inference in Latent Gaussian Models (LGMs). 
+Native-Julia implementation of the Integrated Nested Laplace Approximation
+(INLA) for approximate Bayesian inference in latent Gaussian models. The
+goal is parity with [R-INLA](https://www.r-inla.org/) on its reference
+examples, with comparable or better warm wall time.
 
-This package is designed as a modern, high-performance alternative to the R-INLA package, leveraging Julia's multiple dispatch, powerful automatic differentiation (AD) ecosystem, and sparse linear algebra capabilities.
+> Status: under active development on the `worktree-inla-correctness-fix`
+> branch. See [`CLAUDE.md`](CLAUDE.md) for the full plan and the current
+> phase.
 
 ## Architecture
 
-The project is structured as a meta-package with three core sub-components to ensure modularity and high performance:
+Three sub-packages plus a thin user-facing API:
 
-1. **`INLACore`**: The mathematical engine. Handles high-performance mode-finding via `Optimization.jl`, sparse Hessian extraction via `DifferentiationInterface.jl`, and $O(n)$ marginal variance computations using the Takahashi equations.
-2. **`INLAModels`**: The statistical infrastructure. Defines observation likelihoods (Gaussian, Poisson, Bernoulli), Latent Gaussian Markov Random Field (GMRF) structures (IID, RW1, AR1, SPDE), and Penalized Complexity (PC) priors.
-3. **`INLASpatial`**: The spatial modeling engine. Handles 2D Delaunay triangulation via `Meshes.jl` and constructs the Finite Element Method (FEM) mass and stiffness matrices required for Stochastic Partial Differential Equation (SPDE) models.
+* **`INLACore`** — sparse Cholesky / Newton GMRF solver, augmented (KKT)
+  constrained Newton, Takahashi selected inverse, CCD integration nodes.
+* **`INLAModels`** — likelihoods (Gaussian, Bernoulli, Poisson), latent
+  models (`IIDModel`, `RW1Model`, `BesagModel`, `BivariateIIDModel`,
+  `SPDEModel`, `ICARModel`, `NonStationarySPDEModel`), the
+  `n_hyper / assemble_Q / log_prior / constraint_matrix` interface, and
+  log-Gamma / Gaussian priors matching R-INLA's conventions.
+* **`INLASpatial`** — 2D Delaunay triangulation via `Meshes.jl`, FEM
+  mass/stiffness assembly, SPDE precision construction.
 
 ## Installation
-
-Currently, the package is in development. To use it, you must instantiate the environment and develop the local sub-packages.
 
 ```julia
 using Pkg
 Pkg.activate(".")
+Pkg.develop([
+    Pkg.PackageSpec(path = "dev/INLACore"),
+    Pkg.PackageSpec(path = "dev/INLAModels"),
+    Pkg.PackageSpec(path = "dev/INLASpatial"),
+])
 Pkg.instantiate()
-
-# Ensure local sub-packages are linked
-Pkg.develop(path="dev/INLACore")
-Pkg.develop(path="dev/INLAModels")
-Pkg.develop(path="dev/INLASpatial")
 ```
 
-## Features
+## Performance vs R-INLA 25.10.19
 
-* **Native Formula API**: Uses `StatsModels.jl` for an intuitive `@formula` interface.
-* **Custom Latent Effects**: Supports adding structured latent effects directly in the formula using the `f(covariate, model)` syntax.
-* **Hyperparameter Integration**: Explores the hyperparameter posterior using Central Composite Design (CCD) integration nodes.
-* **Sparse Takahashi Marginals**: Computes posterior marginal variances of the latent field without dense matrix inversion.
-* **Spatial SPDEs**: Full support for Matérn covariance models via FEM discretization on triangular meshes.
+Warm second-run wall time on parity test fixtures, on an Apple M-series CPU.
+Reproduce with `julia --project=. bench/parity_bench.jl` after running
+`bench/Rrun.sh` to refresh the R-INLA fixtures.
 
-## Usage Examples
+| Example | Julia warm (s) | R-INLA `cpu.used["Total"]` (s) | Ratio |
+|---|---:|---:|---:|
+| Salamander mating (Bernoulli + 2 IID) | 0.92 | 2.09 | **0.44×** |
+| Bivariate meta (Gaussian + 2diid)     | 0.15 | 2.08 | **0.07×** |
+| Brunei (Poisson + besag)†             | 0.08 | 1.82 | **0.04×** |
+| Stationary SPDE (Gaussian + SPDE)     | 2.38 | n/a  | n/a   |
 
-### 1. Basic Linear Model with a Random Walk (RW1)
+† Brunei posterior values themselves are still `@test_broken` against
+R-INLA — see the *Status* section below. The runtime number is honest.
+
+Cold (TTFX) runs are ~5–10 s due to Julia's compilation. This is a
+one-time cost per session, not an algorithmic property.
+
+## What works today
+
+* **`f(covariate, ModelType)` formula syntax** via `StatsModels.jl`.
+* **Joint mode finder** with full sparse Hessian
+  `H = Q + Aᵀ Diagonal(−h_η) A`, sparse Cholesky factorization, and
+  Takahashi selected inverse for marginal variances (in original
+  variable order — not the AMD-permuted one).
+* **Hard sum-to-zero constraints** on intrinsic GMRFs (Besag/RW1/etc)
+  via the augmented (KKT) Newton step. Constraint enforced to machine
+  precision.
+* **CCD integration over θ** — for `n_hyper ≥ 1` we evaluate the
+  Laplace objective at every CCD node, normalize via softmax of the
+  log-density gap, and return mixture means and variances.
+* **Simplified-Laplace marginal-mean correction** (`Δx ∝ ½ H⁻¹ Aᵀ
+  (h⁽³⁾ ⊙ σ²_η)`) projected back onto the constraint set when
+  applicable.
+* **Edgeworth correction** to `log π̂(y|θ)` (4th-derivative + 3rd-deriv
+  cross terms on the constrained η-covariance).
+* **R-INLA-style priors** out of the box: log-Gamma(1, 5e-5) on
+  log-precisions; configurable per-model
+  (e.g. `BivariateIIDModel(; a1=…, b1=…, a2=…, b2=…, rho_precision=…)`).
+* **Multi-start BFGS** + PD-fail-safe: BFGS seeds at `theta0`,
+  `fill(5, n_h)`, `fill(-2, n_h)` and picks the best feasible
+  objective; non-finite seeds are filtered out.
+
+## Status — R-INLA reference examples
+
+| Example | Driver runs | Posterior parity | Test |
+|---|:---:|:---:|---|
+| **Salamander** (Bernoulli + IID×2) | ✓ | ✓ to 5 dp | [test/parity/salamander_test.jl](test/parity/salamander_test.jl) — 13/13 at 1 % × R-INLA SD |
+| **Bivariate meta-analysis** (2diid) | ✓ | ✓ at 30 % rtol on precisions, 0.10 atol on ρ | [test/parity/bivariate_test.jl](test/parity/bivariate_test.jl) — 10/10 |
+| **Brunei** (Besag with sum-to-zero) | ✓ | mechanics ✓; per-area means need full per-`x_i` Laplace | [test/parity/brunei_test.jl](test/parity/brunei_test.jl) — 3/3 + 1 broken |
+| **Stationary SPDE** | ✓ | smoke (RMSE recovery from synthetic truth) | [test/parity/spde_test.jl](test/parity/spde_test.jl) — 5/5 |
+| Dengue (besag → fbesag) | partial | not started | — |
+| Joint longitudinal/spatial (Weibull + Gaussian) | not started | — | — |
+
+## Usage
+
+### Salamander mating (Bernoulli + IID random effects)
 
 ```julia
-using IntegratedNestedLaplace
-using DataFrames
+using IntegratedNestedLaplace, DataFrames, RDatasets
+df = dataset("survey", "salamander")
+df.Cross  = string.(df.Cross)
+df.Female = string.(df.Female)
+df.Male   = string.(df.Male)
 
-# Generate some synthetic data
-data = DataFrame(
-    y = [1.1, 0.9, 1.2, 0.8, 1.0],
-    time = 1:5
-)
+res = inla(@formula(Mate ~ 1 + Cross + f(Female, IID) + f(Male, IID)),
+           df, family = BernoulliLikelihood(), theta0 = [1.0, 1.0])
 
-# Run INLA: y ~ intercept + RW1(time)
-# The formula parser automatically detects f() and provisions the RW1Model.
-result = inla(@formula(y ~ 1 + f(time, RW1)), data, family=GaussianLikelihood())
-
-println("Latent Mode: ", result.mode_latent)
-println("Latent Marginals: ", result.marginals_latent)
+println(res)                          # mode → mean ± sd table
+res.mean_latent[1:4]                  # posterior means of the 4 fixed effects
+hyper_precision_mean(res, 1)          # E[exp(θ_F)] = posterior mean of τ_F
 ```
 
-### 2. Spatial SPDE Model
-
-For continuous spatial domains, we use the SPDE approach to approximate a Matérn Gaussian field.
+### Brunei-style areal Poisson with Besag random effect
 
 ```julia
-using IntegratedNestedLaplace
-using DataFrames
+using IntegratedNestedLaplace, SparseArrays, CSV, DataFrames
+df  = CSV.read("examples/06_brunei_school_disparities/data/areas.csv", DataFrame)
+adj = CSV.read("examples/06_brunei_school_disparities/data/adjacency.csv", DataFrame)
+W = sparse(adj.i, adj.j, Float64.(adj.w), nrow(df), nrow(df))
 
-# Define spatial observation coordinates
-coords = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)]
-
-# Create a spatial dataset
-data = DataFrame(
-    y = [1.0, 0.5, 0.5, 0.0, 0.8],
-    loc_id = 1:5
-)
-
-# 1. Build the Delaunay Mesh
-mesh = build_mesh(coords)
-
-# 2. Compute the FEM Mass (C) and Stiffness (G) matrices
-C, G = spde_matrices(mesh)
-
-# 3. Create the SPDE Latent Model
-spde = SPDEModel(C, G)
-
-# 4. Run INLA
-# We pass the SPDE structure via the `latent` keyword argument, 
-# while mapping it in the formula using `f(loc_id, SPDE)`.
-result = inla(@formula(y ~ 1 + f(loc_id, SPDE)), data, latent=spde)
-
-println("Spatial Latent Mode: ", result.mode_latent)
-println("Hyperparameter Mode (log kappa, log tau): ", result.mode_hyper)
+besag = BesagModel(W; scale = true)   # scale.model = TRUE in R-INLA
+res = inla(@formula(y ~ 1 + f(area, Besag)), df,
+           family = PoissonLikelihood(),
+           latent = besag,
+           offset = log.(df.E),
+           theta0 = [1.0])
 ```
 
-## Performance & GPU Support
+### Bivariate IID with R-INLA-style prior
 
-`IntegratedNestedLaplace.jl` is designed for extreme performance. By utilizing $O(n)$ sparse Cholesky paths and KernelAbstractions, it matches or exceeds the performance of R-INLA for standard models.
-
-### Benchmarks (1000 observations, IID model)
-| Backend | Time (Warm) |
-| :--- | :--- |
-| **CPU (M-series)** | **0.06s** |
-| **Metal (GPU)** | **0.54s** |
-
-### Using GPU Acceleration
-The package supports heterogeneous backends via `KernelAbstractions.jl`. 
-
-#### Apple Silicon (Metal)
 ```julia
-using Metal
-res = inla(formula, data, backend=MetalBackend())
+using IntegratedNestedLaplace, DataFrames, CSV
+df = CSV.read("examples/05_meta_analysis/data/bivariate_synthetic.csv", DataFrame)
+
+# Match R-INLA's f(., model="2diid", param=c(0.25,0.025,0.25,0.025,0,0.4))
+biv = BivariateIIDModel(; a1 = 0.25, b1 = 0.025,
+                         a2 = 0.25, b2 = 0.025,
+                         rho_precision = 0.4)
+
+res = inla(@formula(y ~ f(study, BivariateIID)), df,
+           family = GaussianLikelihood(),
+           latent = biv, theta0 = [4.0, 1.0, 0.5, 0.0])
+
+# theta layout: [log τ_y, log τ₁, log τ₂, atanh ρ]
+tanh(res.mean_hyper[4])               # posterior mean of ρ
 ```
 
-#### NVIDIA (CUDA)
-```julia
-using CUDA
-res = inla(formula, data, backend=CUDABackend())
+## Reproducing the parity benchmark
+
+The R-side fixtures are committed at `test/fixtures/<id>/rinla_reference.json`.
+To regenerate (e.g. after upgrading R-INLA), run:
+
+```sh
+bench/Rrun.sh                       # all examples
+bench/Rrun.sh 04_salamander_mating  # one example
 ```
 
-Note: GPU acceleration is recommended for very large datasets ($10^5+$ observations), where the parallel throughput outweighs the data transfer latency. Metal users will automatically use `Float32` precision, while CUDA/CPU users default to `Float64`.
+Each `examples/<id>/rinla.R` script writes the reference JSON; the matching
+Julia parity test loads it and asserts agreement.
 
 ## References
 
-1. Rue, H., Martino, S., & Chopin, N. (2009). *Approximate Bayesian inference for latent Gaussian models by using integrated nested Laplace approximations*. Journal of the royal statistical society: Series b (statistical methodology), 71(2), 319-392.
-2. Lindgren, F., Rue, H., & Lindström, J. (2011). *An explicit link between Gaussian fields and Gaussian Markov random fields: the stochastic partial differential equation approach*. Journal of the Royal Statistical Society: Series B (Statistical Methodology), 73(4), 423-498.
+1. Rue, H., Martino, S., & Chopin, N. (2009). *Approximate Bayesian
+   inference for latent Gaussian models by using integrated nested Laplace
+   approximations*. JRSSB **71(2)** 319–392.
+2. Lindgren, F., Rue, H., & Lindström, J. (2011). *An explicit link
+   between Gaussian fields and Gaussian Markov random fields: the SPDE
+   approach*. JRSSB **73(4)** 423–498.
+3. Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H. (2016). *An
+   intuitive Bayesian spatial model for disease mapping that accounts
+   for scaling*. Statistical Methods in Medical Research **25(4)**
+   1145–1165 (BYM2 reparameterisation, used by `scale.model = TRUE` in
+   `BesagModel`).

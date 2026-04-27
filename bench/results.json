@@ -1,0 +1,22 @@
+[
+  {
+    "julia": 0.916215125,
+    "label": "Salamander mating",
+    "rinla": 2.0934431553
+  },
+  {
+    "julia": 0.150065708,
+    "label": "Bivariate meta (2diid)",
+    "rinla": 2.0811538696
+  },
+  {
+    "julia": 0.0745925,
+    "label": "Brunei (besag)",
+    "rinla": 1.8202869892
+  },
+  {
+    "julia": 2.376944084,
+    "label": "Stationary SPDE",
+    "rinla": null
+  }
+]

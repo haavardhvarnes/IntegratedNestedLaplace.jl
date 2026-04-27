@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(julia --project=. test/runtests.jl)",
+      "Bash(julia --project=. test/parity/salamander_test.jl)",
+      "Bash(julia --project=. examples/03_swiss_rainfall/model.jl)",
+      "WebFetch(domain:r-inla.org)"
+    ]
+  }
+}
