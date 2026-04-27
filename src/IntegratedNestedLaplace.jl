@@ -487,21 +487,22 @@ function inla(form::FormulaTerm, data;
         #     `log|Q_c| = log|Q + A_c' A_c|`. The standard
         #     `log|Q| − log(A_c Q⁻¹ A_c')` form is undefined (Q is singular).
         #   * For `H = Q + Aᵀ D A` (full rank thanks to the data term): use
-        #     the textbook form `log|H_c| = log|H| − log(A_c H⁻¹ A_c')`. The
-        #     augmented form `log|H + A_c' A_c|` gives a wrong (off by
-        #     `2 log s` where `s = A_c H⁻¹ A_c'`) result for full-rank H.
-        # Empirically these two formulas differed by ≈ −21 nats on Brunei,
-        # which is a constant shift (doesn't move the θ optimum) but is the
-        # mathematically correct answer.
+        #     the textbook form `log|H_c| = log|H| + log(A_c H⁻¹ A_c')`. The
+        #     PLUS sign is required: at H = diag(2,3), A=(1,0), the true
+        #     conditional precision in the e_2 direction is 3 = log|H| +
+        #     log|A H⁻¹ A'| = log 6 + log(1/2). Phase 6a's MINUS form was
+        #     a sign error introduced when switching away from the augmented
+        #     form. R-INLA's `problem-setup.c::1048–1049` confirms PLUS via
+        #     `[x|Ax] = [x][Ax|x]/[Ax]` decomposition.
         obj_main = try
             if has_constraints
                 AcT = sparse(A_constraint')
                 Q_aug = Q + AcT * A_constraint
                 log_det_Q_c = sparse_logdet(Q_aug)
-                # log|H_c| = log|H| − log(A_c H⁻¹ A_c')   (full-rank H form)
+                # log|H_c| = log|H| + log(A_c H⁻¹ A_c')   (full-rank H form)
                 Wc = F_H \ Matrix(AcT)
                 S_h = Symmetric(Matrix(A_constraint * Wc))
-                log_det_H_c = log_det_H - logdet(S_h)
+                log_det_H_c = log_det_H + logdet(S_h)
                 lp_correct = -0.5 * dot(x_star, Q * x_star) + 0.5 * log_det_Q_c
                 ll + lp_correct - 0.5 * log_det_H_c
             else

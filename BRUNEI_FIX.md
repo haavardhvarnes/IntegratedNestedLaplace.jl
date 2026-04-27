@@ -134,19 +134,188 @@ The Gaussian gap is ~1 nat in log τ (factor 3 in τ). The Poisson gap is
    constrained subspace, or how my mode-finder interacts with the
    constraint. Worth a focused investigation pass.
 
-### Phase 6c — promoted
+### Phase 6c.1 — Term-by-term diagnostic at fixed θ  ✅ landed; **found a real bug, but Brunei not yet green**
 
-* [ ] **6c.1 Diagnostic** *(~½ d)*: at a single fixed θ, dump
-  `(x*, log|Q_c|, log|H_c|, log p(y|x*), log p(x*|θ))` from Julia and
-  from an equivalent R-INLA call (same data, same θ, same constraint).
-  Identify which quantity disagrees and by how much. Tells us whether
-  the bug is in mode-finding, Hessian, log-determinant, likelihood
-  evaluation, or the prior contribution.
-* [ ] **6c.2 Strategy `laplace`** *(~3 d)*: implement R-INLA's full
-  per-`x_i` Laplace re-fit. Heavier but matches R-INLA's most accurate
-  code path.
+What landed:
 
-6c.1 must come before 6c.2.
+* [x] `bench/brunei_dump.jl` — at fixed θ, dumps every scalar component of
+  Julia's constrained-Laplace marginal-log-density formula (intercept,
+  `u[1:5]`, `sum(u*)`, `log p(y|x*,θ)`, `½ x' Q x`, `log|Q + A_c'A_c|`,
+  `log|H|`, `log(A_c H⁻¹ A_c')`, IS correction, prior, final obj). Writes
+  JSON for cross-comparison.
+* [x] `bench/brunei_rinla_dump.R` — mirror on the R-INLA side. Uses
+  `inla(..., hyper=list(prec=list(initial=θ, fixed=TRUE)))` to fix θ.
+  Extracts `cfg$mean` in R-INLA's `(u_1..u_42, β)` layout and the joint
+  `cfg$Q`. Symmetrizes `cfg$Qprior` (R-INLA stores it upper-triangular).
+
+What the diagnostic found:
+
+1. **`BesagModel`'s `_besag_scale_factor` was inverted.** The function computed
+   `geom_mean(diag(Σ_constrained))` correctly, but then returned
+   `1.0 / geom_mean` — the *wrong* multiplier. With `Q_scaled = c · Q_unscaled`,
+   the marginal variance scales as `1/c`, so to make
+   `geom_mean(Var_scaled) = 1` we need `c = geom_mean(Var_unscaled)`, not its
+   reciprocal. With the inverted factor, Julia's `Q[1,1] = 25.98` against
+   R-INLA's `Qprior[1,1] = 8.41` — a factor-of-3 discrepancy, and
+   `geom_mean(Var_scaled) = 0.32` instead of `1`. **Fixed in
+   `dev/INLAModels/src/INLAModels.jl::_besag_scale_factor`.**
+
+2. **After the fix, every component except one matches R-INLA exactly at fixed θ.**
+   At θ = 2.0 (τ = 7.39), with the fix:
+   * `β`, `u[1:5]`, `sum(u*)`, `||u*||₂` — match to 5 dp
+   * `log p(y | x*, θ) = 51.518` — matches
+   * `½ x*' Q x* = 5.624` — matches (after symmetrizing R-INLA's upper-
+     triangular `Qprior` storage)
+   * `log|Q + A_c'A_c|` — matches
+   * `log|H|` — matches
+
+3. **The one quantity that *doesn't* match is `log(A_c H⁻¹ A_c')`, and it's
+   the τ-dependent slope that drives the wrong optimum.**
+
+   | θ = log τ | Julia `log(A_c H⁻¹ A_c')` | R-INLA `log(A_c H⁻¹ A_c')` |
+   | ---:      | ---:                       | ---:                        |
+   | 2.0       | ≈ 10.65                    | −2.30                       |
+   | 10.0      | ≈ 10.65                    |  9.21                       |
+
+   Julia's value is **constant ≈ 10.65** across the entire θ grid; R-INLA's
+   **varies by ≈ 11.5 nats**. Since the textbook constraint correction is
+   `log|H_c| = log|H| − log(A_c H⁻¹ A_c')`, this is exactly the term
+   that contributes a θ-dependent slope to `−½ log|H_c|`, and it's the
+   one ingredient missing on Julia's side. Constant-in-θ on our side
+   means our `H⁻¹` is being projected against `A_c` in a way that's
+   dominated by an effectively-flat (intercept-driven) direction —
+   plausibly because under our `N(0, 10³)` intercept prior the
+   constrained `H` has a near-singular direction along
+   `A_c = (0; 1/√n · 1)` that doesn't tighten with τ.
+
+4. **`x*`-match is solid.** Same data, same θ, same constraint —
+   `gmrf_newton_full` produces the same constrained mode as R-INLA at every
+   θ tested. The mode-finder is not the problem.
+
+What this **does** fix:
+* Julia's `BesagModel` now reproduces R-INLA's `scale.model = TRUE` precision
+  matrix exactly. This was a real correctness bug and the fix is independent
+  of the rest of Phase 6c.
+* No regressions on Salamander (13/13), Bivariate (10/10), SPDE (5/5), or
+  the main test suite (15/15).
+
+What this **does not** fix:
+* Brunei BFGS still drifts to τ ≈ 17 700 (R-INLA τ ≈ 19). The
+  `log(A_c H⁻¹ A_c')` slope discrepancy is the live bug.
+  `test/parity/brunei_test.jl` stays `@test_broken` on the per-area
+  linear-predictor parity assertion.
+
+### Phase 6c.2 — Refined diagnosis (the original 6c.2 hypothesis was misframed)
+
+What we initially thought was a bug — that R-INLA's reported
+`log(A_c · cfg$Q⁻¹ · A_c')` varied with θ while ours was constant —
+turned out to compare *the wrong matrices*. R-INLA's `cfg$Q` is built
+on the GMRF graph pattern only, so the intercept (an isolated node in
+that graph) has all off-diagonal entries to the area block equal to
+zero. Specifically, for Brunei at fixed θ we observed `cfg$Q[β, β] = 126
+= sum(y)` but `cfg$Q[β, u_i] = 0` for all i — the *diagonal* data
+contribution is included but the *off-diagonal* one is dropped. So
+`cfg$Q ≠ Q_prior + Aᵀ D A`; it's neither the joint H nor the prior Q,
+but a graph-restricted partial. Verified by reading `Q[k++] =
+gmrf_approx->tab->Qfunc(...)` in
+`/tmp/r-inla/gmrflib/approx-inference--classic.c::4126–4132` — the loop
+iterates over `(ii, jj)` in `g->lnbs[ii]` (graph neighbours), not over
+the joint H sparsity pattern.
+
+The right scalar to compare against is **`res$mlik[1, 1]`** (R-INLA's
+marginal log-likelihood at fixed θ).  Across `θ ∈ {0, 1, 1.5, 1.88, 2,
+3, 5, 7, 10}`:
+
+| θ    | τ          | R-INLA mlik | Julia obj (current) |
+| ---: | ---:       | ---:        | ---:                |
+| 0    | 1.0        | −94.85      | 27.68               |
+| 1.5  | 4.5        | **−90.73**  | 36.33               |
+| 1.88 | 6.5        | −90.94      | 37.35               |
+| 3    | 20         | −92.99      | **38.48**           |
+| 5    | 148        | −96.60      | 37.85               |
+| 7    | 1097       | −97.61      | 37.56               |
+| 10   | 22 026     | −97.78      | 37.52               |
+
+The shapes mismatch in two ways:
+1. R-INLA's optimum is at θ ≈ 1.5; ours is at θ ≈ 3.
+2. R-INLA drops 7 nats from peak to θ = 10; we drop 1 nat. Our objective
+   is too flat in the right tail.
+
+### Real findings from reading R-INLA's source (`problem-setup.c::975–1053`)
+
+R-INLA's *exact* constrained-Gaussian-density formula at the mode is
+
+```
+sub_logdens = −½·n·log(2π) + ½·log|Q| − ½·(x*−μ)ᵀQ(x*−μ)
+              − ½·log|A·A'|                      (Jacobian of A)
+              + ½·n_c·log(2π)                    (degrees freed)
+              + ½·log|A·Q⁻¹·A'|                  (constrained density)
+              + ½·(Aμ−b)ᵀ(A·Q⁻¹·A')⁻¹·(Aμ−b)    (constraint mean term)
+```
+
+with the comment `[x|Ax] = [x] · [Ax|x] / [Ax]` (lines 1045–1049).
+The Q in this formula is the *posterior precision* (our H) when
+sub_logdens evaluates the Laplace-Gaussian density at x*.
+
+This implies the textbook identity:
+
+```
+log|H_c| = log|H| + log|A_c H⁻¹ A_c'|         (PLUS sign, normalized A_c)
+```
+
+Verified with a 2×2 toy: `H = diag(2, 3)`, `A = (1, 0)` (constraint
+`x_1 = 0`). True conditional precision in the e_2 direction is 3, so
+`log|H_c| = log 3`. The formula gives `log 6 + log(1/2) = log 3` ✓
+(our current code uses minus and gives `log 6 − log(1/2) = log 12` ✗).
+
+### Real bugs to fix in Phase 6c.2
+
+1. **Sign error in `laplace_eval`** at
+   [src/IntegratedNestedLaplace.jl:504](src/IntegratedNestedLaplace.jl):
+   ```julia
+   log_det_H_c = log_det_H - logdet(S_h)   # WRONG
+   log_det_H_c = log_det_H + logdet(S_h)   # CORRECT
+   ```
+   Phase 6a's switch to "textbook minus" was the wrong sign. **For Brunei
+   this only changes the constant offset** (log|A_c H⁻¹ A_c'| ≈ 10.65 is
+   ~θ-independent under our `prec_intercept = 1e−3` setup), so it doesn't
+   move the τ optimum. **It does** matter for any model with a θ-varying
+   `log|A_c H⁻¹ A_c'|`.
+
+2. **`prec_intercept = 0` improper-prior handling** is the actual
+   structural fix that moves Brunei's optimum.  R-INLA uses
+   `prec.intercept = 0`; we hard-code `Q_fixed_block = 1e−3·I`. The
+   1e−3 substitute makes the unidentifiable direction
+   `v = (e_β − ones_in_u_block)/√(n+1)` have a fixed (not τ-dependent)
+   eigenvalue in `H`, which clamps `log|A_c H⁻¹ A_c'|` to a
+   τ-independent constant. With `prec_intercept = 0`, that direction
+   has eigenvalue 0 in the prior Q — and the data contributes 0 to it
+   too because `A · v = 0` exactly — so `H` is rank-deficient by 1.
+   To handle this we must **augment the constraint matrix `A_c`** to
+   include the row `v_normalized` (or equivalently, do the standard
+   "improper prior → extra constraint" trick), bringing `n_c` from 1 to
+   2. Then the augmented `H + A_full' A_full` is full rank and the
+   `log|A_full · (H + A_full' A_full)⁻¹ · A_full'|` is well-defined.
+
+   Mechanically this means modifying `inla()` and `laplace_eval`:
+   * Detect intrinsic prior on the fixed effect (or expose
+     `prec_intercept` as a knob). When 0, append the unidentifiable
+     direction to the user constraint matrix.
+   * Newton step (`gmrf_newton_full`) already supports multi-row
+     constraints; only the `A_c` build site needs to change.
+   * Determinant corrections in `laplace_eval` use the augmented
+     `A_full`. The user-facing `log(A_c …)` reporting can stay on the
+     user constraint; the *internal* Laplace formula uses `A_full`.
+
+* [x] **6c.2.a Sign fix landed.** [src/IntegratedNestedLaplace.jl:504](src/IntegratedNestedLaplace.jl)
+   now uses `log_det_H + logdet(S_h)` (PLUS). Verified no regressions:
+   runtests 15/15, salamander 13/13, bivariate 10/10, SPDE 5/5,
+   Brunei 3 + 1 broken (sign change only shifts the obj by a constant
+   on Brunei since `log(A_c H⁻¹ A_c')` is θ-independent under our
+   `prec_intercept = 1e−3` setup).
+* [ ] **6c.2.b Implement improper-prior augmentation** (the real Brunei
+   fix — bigger task, touches `inla()` constraint build + the dumpers).
+* [ ] **6c.2.c Drop `@test_broken`** when Brunei matches acceptance criteria.
 
 ## Acceptance criteria
 
