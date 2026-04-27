@@ -441,8 +441,25 @@ function inla(form::FormulaTerm, data;
         grad_eta_offset(eta) = grad_eta_raw(eta .+ o_vec)
         hess_eta_offset(eta) = hess_eta_diag_raw(eta .+ o_vec)
 
-        x_star = gmrf_newton_full(grad_eta_offset, hess_eta_offset, A_total, Q, x_warm;
-                                  constraint_A = has_constraints ? A_constraint : nothing)
+        # When the user's θ pushes Q into a numerically-singular region we
+        # return a *smooth, finite* penalty rather than Inf. Inf would NaN the
+        # finite-difference gradient and kill BFGS's line search; a large
+        # penalty + ‖θ‖² gradient instead nudges the optimizer back toward
+        # the feasible region.
+        bad_theta_penalty = 1e8 + 1e3 * sum(abs2, theta)
+        # Defend against poisoned warm-start (a previous failed eval can leave
+        # NaN/Inf in x_warm; reset to zero in that case).
+        if any(!isfinite, x_warm)
+            fill!(x_warm, 0.0)
+        end
+        x_star = try
+            gmrf_newton_full(grad_eta_offset, hess_eta_offset, A_total, Q, x_warm;
+                             constraint_A = has_constraints ? A_constraint : nothing)
+        catch err
+            err isa PosDefException || rethrow()
+            return (bad_theta_penalty, copy(x_warm),
+                    cholesky(Symmetric(sparse(I * 1.0, n_latent, n_latent))))
+        end
         copyto!(x_warm, x_star)
 
         eta_star = A_total * x_star .+ o_vec
@@ -450,7 +467,13 @@ function inla(form::FormulaTerm, data;
 
         h_eta = hess_eta_diag_raw(eta_star)
         H = Q + sparse(A_total' * spdiagm(0 => -h_eta) * A_total)
-        F_H = cholesky(Symmetric(H))
+        F_H = try
+            cholesky(Symmetric(H))
+        catch err
+            err isa PosDefException || rethrow()
+            return (bad_theta_penalty, x_star,
+                    cholesky(Symmetric(sparse(I * 1.0, n_latent, n_latent))))
+        end
         log_det_H = logdet(F_H)   # = log|H|, see sparse_logdet docstring
 
         # Constrained-determinant corrections. The Laplace approximation lives
@@ -468,18 +491,23 @@ function inla(form::FormulaTerm, data;
         # The augmented form uses sparse Cholesky on `M + A_c' A_c`, which is
         # always well-conditioned by construction (`A_c' A_c` puts a unit
         # eigenvalue in the otherwise near-null direction).
-        if has_constraints
-            AcT = sparse(A_constraint')
-            AcTAc = AcT * A_constraint
-            Q_aug = Q + AcTAc
-            H_aug = H + AcTAc
-            log_det_Q_c = sparse_logdet(Q_aug)
-            log_det_H_c = sparse_logdet(H_aug)
-            lp_correct = -0.5 * dot(x_star, Q * x_star) + 0.5 * log_det_Q_c
-            obj_main = ll + lp_correct - 0.5 * log_det_H_c
-        else
-            lp = -0.5 * dot(x_star, Q * x_star) + 0.5 * sparse_logdet(Q)
-            obj_main = ll + lp - 0.5 * log_det_H
+        obj_main = try
+            if has_constraints
+                AcT = sparse(A_constraint')
+                AcTAc = AcT * A_constraint
+                Q_aug = Q + AcTAc
+                H_aug = H + AcTAc
+                log_det_Q_c = sparse_logdet(Q_aug)
+                log_det_H_c = sparse_logdet(H_aug)
+                lp_correct = -0.5 * dot(x_star, Q * x_star) + 0.5 * log_det_Q_c
+                ll + lp_correct - 0.5 * log_det_H_c
+            else
+                lp = -0.5 * dot(x_star, Q * x_star) + 0.5 * sparse_logdet(Q)
+                ll + lp - 0.5 * log_det_H
+            end
+        catch err
+            err isa PosDefException || rethrow()
+            return (bad_theta_penalty, x_star, F_H)
         end
 
         lprior = log_prior(family, theta_y)
@@ -561,26 +589,31 @@ function inla(form::FormulaTerm, data;
 
     seeds = [theta_init]
     if n_h > 0
-        # Default seeds bracket the typical posterior region for log-precision:
-        # one near the log-Gamma prior mode (~log 20000), one in the
-        # weak-shrinkage corner. The user's `theta0` (or zeros) remains the
-        # primary seed; the others guard against local minima.
+        # Bracket the typical log-precision posterior. One near the log-Gamma
+        # prior mode (~log 20000), one in the weak-shrinkage corner. The
+        # user's `theta0` remains the primary seed.
         push!(seeds, fill(5.0, n_h))
         push!(seeds, fill(-2.0, n_h))
     end
+    # Drop seeds where the objective is non-finite (e.g. degenerate Q for
+    # extreme SPDE parameters). Without this filter, BFGS launched from a
+    # bad seed produces NaN gradients that propagate to the CCD pass.
+    feasible_seeds = filter(s -> isfinite(laplace_obj(s)), seeds)
+    isempty(feasible_seeds) && error("no feasible θ seeds; try a smaller theta0")
 
-    best_theta = theta_init
+    best_theta = first(feasible_seeds)
     best_obj   = Inf
-    for seed in seeds
+    for seed in feasible_seeds
         prob = Optimization.OptimizationProblem(optf, seed)
         try
             sol = Optimization.solve(prob, inner_solver;
                                      maxiters = max_outer_iter,
                                      abstol = 1e-7, reltol = 1e-7)
-            v = laplace_obj(collect(sol.u))
-            if v < best_obj
+            cand = collect(sol.u)
+            v = laplace_obj(cand)
+            if isfinite(v) && v < best_obj
                 best_obj = v
-                best_theta = collect(sol.u)
+                best_theta = cand
             end
         catch
             # one bad seed shouldn't kill the whole call
@@ -604,9 +637,30 @@ function inla(form::FormulaTerm, data;
                           [collect(theta_star)], [1.0], form)
     end
 
-    # Compute the Hessian H_θ at θ* via central finite differences.
+    # If the converged mode itself has non-finite latent (the inner Newton
+    # bailed during the BFGS line search and best_theta is from a degenerate
+    # seed), skip the CCD pass altogether.
+    if any(!isfinite, x_star) || any(!isfinite, marginals_at_mode)
+        return INLAResult(x_star, x_star,
+                          theta_star, theta_star,
+                          marginals_at_mode,
+                          hcat(theta_star, fill(NaN, n_h)),
+                          [collect(theta_star)], [1.0], form)
+    end
+
+    # Compute the Hessian H_θ at θ* via central finite differences. If the
+    # finite-diff probe lands in a PD-fail region (penalty values fill the
+    # Hessian entries), eigendecomposition will choke — fall back to a
+    # mode-only result with a single-node "CCD".
     H_theta = _finitediff_hessian(laplace_obj, theta_star)
-    H_theta = Symmetric(H_theta + 1e-9 * I)  # tiny ridge for numerical PD
+    if !all(isfinite, H_theta)
+        return INLAResult(x_star, x_star,
+                          theta_star, theta_star,
+                          marginals_at_mode,
+                          hcat(theta_star, fill(NaN, n_h)),
+                          [collect(theta_star)], [1.0], form)
+    end
+    H_theta = Symmetric(H_theta + 1e-9 * I)
 
     # Generate CCD nodes around θ* in θ-space.
     nodes = integration_nodes(theta_star, Matrix(H_theta))
@@ -629,39 +683,53 @@ function inla(form::FormulaTerm, data;
         obj_k, x_k, F_k = laplace_eval(nodes[k])
         obj_at[k] = obj_k
 
+        # If the inner Newton at this CCD node failed (returned the bad-θ
+        # penalty), exclude this node from the mixture by giving it an
+        # effectively-zero weight downstream.
+        if !isfinite(obj_k) || any(!isfinite, x_k)
+            obj_at[k] = +Inf
+            x_at[k]   = copy(x_star)
+            var_at[k] = copy(marginals_at_mode)
+            continue
+        end
+
         if has_sla
             theta_y_k, _ = _slices(nodes[k])
             eta_k = A_total * x_k .+ o_vec
             h3 = third_deriv_eta(family, eta_k, theta_y_k)
-            # σ²_(η_k) per observation = diag(A H⁻¹ Aᵀ).
-            # Solve H · Z = Aᵀ once (n_obs RHS); σ²_η = colwise(A · Z).
             AT = sparse(A_total')
-            Z  = F_k \ Matrix(AT)            # n_latent × n_obs
+            Z  = F_k \ Matrix(AT)
             sigma2_eta = vec(sum(A_total .* Z', dims = 2))
-            v_obs = h3 .* sigma2_eta         # length n_obs
-            Av = A_total' * v_obs            # length n_latent
+            v_obs = h3 .* sigma2_eta
+            Av = A_total' * v_obs
             delta_x = 0.5 .* (F_k \ Av)
-            # The SLA correction uses the unconstrained Σ = H⁻¹. Project the
-            # shift back onto the constraint set so `x* + Δx` still satisfies
-            # A_c x = 0 (Δx_c = Δx − A_cᵀ (A_c A_cᵀ)⁻¹ A_c Δx). For our
-            # normalized constraint A_c A_cᵀ = I, so the projection is just a
-            # rank-k subtraction.
             if has_constraints
                 violation = A_constraint * delta_x
-                # k×k Schur (=I for normalized A_c) → just subtract Aᵀ violation
                 delta_x .-= A_constraint' * violation
             end
-            x_at[k] = x_k .+ delta_x
+            x_at[k] = all(isfinite, delta_x) ? x_k .+ delta_x : x_k
         else
             x_at[k] = x_k
         end
-        var_at[k] = takahashi_diag(F_k)
+        var_k = takahashi_diag(F_k)
+        var_at[k] = all(isfinite, var_k) ? var_k : copy(marginals_at_mode)
     end
 
-    # Convert −log posterior values into normalized weights.
-    log_w = -(obj_at .- minimum(obj_at))
-    log_w_max = maximum(log_w)
+    # Convert −log posterior values into normalized weights. Nodes with Inf
+    # objective (excluded) get weight 0 in the softmax.
+    finite_objs = filter(isfinite, obj_at)
+    if isempty(finite_objs)
+        return INLAResult(x_star, x_star,
+                          theta_star, theta_star,
+                          marginals_at_mode,
+                          hcat(theta_star, fill(NaN, n_h)),
+                          [collect(theta_star)], [1.0], form)
+    end
+    log_w = -(obj_at .- minimum(finite_objs))
+    log_w[.!isfinite.(log_w)] .= -Inf
+    log_w_max = maximum(filter(isfinite, log_w))
     w = exp.(log_w .- log_w_max)
+    w[.!isfinite.(w)] .= 0.0
     w ./= sum(w)
 
     # Mixture posterior moments for the latent field.
