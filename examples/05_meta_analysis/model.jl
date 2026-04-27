@@ -20,17 +20,17 @@ end
 
 df = get_meta_data(10) # 10 studies for fast demo
 
-# 2. Run Model
-# We model y ~ study_effect (BivariateIID)
-# The BivariateIID model expects 3 hyperparameters: log-tau1, log-tau2, logit-rho
+# 2. Run Model: y ~ study_effect (BivariateIID).
+# Gaussian likelihood contributes one hyperparameter (log τ_y), then the
+# BivariateIID block adds three (log τ₁, log τ₂, atanh ρ) — four total.
 println("Running IntegratedNestedLaplace.jl...")
 start_time = time()
 
 res = inla(
     @formula(y ~ f(study, BivariateIID)),
     df,
-    family=GaussianLikelihood(),
-    theta0=[1.0, 1.0, 0.5] # log-tau1, log-tau2, atanh(rho)
+    family = GaussianLikelihood(),
+    theta0 = [4.0, 1.0, 1.0, 0.5],   # log τ_y, log τ₁, log τ₂, atanh ρ
 )
 
 end_time = time()
@@ -39,6 +39,6 @@ end_time = time()
 println(res)
 println("Total Execution Time: ", round(end_time - start_time, digits=4), "s")
 
-# theta[3] is atanh(rho). 
-rho_est = tanh(res.mode_hyper[3])
+# theta layout: [log τ_y, log τ₁, log τ₂, atanh ρ]. Last entry is atanh(ρ).
+rho_est = tanh(res.mode_hyper[end])
 println("Estimated correlation (rho): ", round(rho_est, digits=4))

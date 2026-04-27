@@ -32,15 +32,17 @@ B_tau = hcat(ones(n_v), [ustrip.(to(vertex(mesh, i)))[2] for i in 1:n_v])
 println("Running IntegratedNestedLaplace.jl...")
 start_time = time()
 
-# Provision NonStationarySPDEModel
+# Provision NonStationarySPDEModel.
 ns_spde = NonStationarySPDEModel(C, G, B_kappa, B_tau)
 
-# We have 2 params for kappa and 2 for tau = 4 hypers
+# Hyperparameter layout under Gaussian likelihood:
+#   [log τ_y,  θ_κ_1, θ_κ_2,  θ_τ_1, θ_τ_2]   (5 hypers total)
 res = inla(
     @formula(y ~ f(loc_id, NonStationarySPDE)),
     df,
-    latent=ns_spde,
-    theta0=[0.5, 0.1, 0.5, 0.1]
+    family = GaussianLikelihood(),
+    latent = ns_spde,
+    theta0 = [4.0, 0.5, 0.1, 0.5, 0.1],
 )
 
 end_time = time()
@@ -48,5 +50,5 @@ end_time = time()
 # 4. Results
 println(res)
 println("Total Execution Time: ", round(end_time - start_time, digits=4), "s")
-println("Estimated non-stationary log-kappa basis coeffs: ", res.mode_hyper[1:2])
-println("Estimated non-stationary log-tau basis coeffs:   ", res.mode_hyper[3:4])
+println("Estimated non-stationary log-kappa basis coeffs: ", res.mode_hyper[2:3])
+println("Estimated non-stationary log-tau basis coeffs:   ", res.mode_hyper[4:5])
