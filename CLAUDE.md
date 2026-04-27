@@ -241,6 +241,39 @@ What landed:
   produces an indefinite Q on small meshes.
 * **`fbesag` non-stationary Brazil parity**.
 
+### Phase 5 — Edgeworth correction to `log π̂(y|θ)`  ✅ landed (insufficient for Brunei)
+
+What landed:
+
+- [x] **`fourth_deriv_eta(family, η, θ_y)`** dispatch alongside the existing
+  third-derivative one (Bernoulli `−p(1−p)(1−6p(1−p))`, Poisson `−exp(η)`,
+  Gaussian zero).
+- [x] **Edgeworth correction inside `laplace_eval`** (so BFGS sees the
+  corrected objective at every θ evaluation):
+  ```
+  correction(θ) = -⅛ ∑_k h⁽⁴⁾_k σ²²_k
+                  + ⅛ ∑_{k,l} h⁽³⁾_k h⁽³⁾_l σ²_k σ²_l Σ_(k,l)
+                  + ¹⁄₁₂ ∑_{k,l} h⁽³⁾_k h⁽³⁾_l Σ³_(k,l)
+  ```
+  where `Σ` is the η-marginal covariance under the *constrained* Gaussian
+  Laplace. Cost is one extra CHOLMOD multi-RHS solve per `laplace_eval` call.
+  Robust against degenerate cases (returns 0 if intermediate values are
+  non-finite — matters when τ → ∞ pushes the constrained Σ near singular).
+
+What this **does** fix:
+- Nothing visibly on Salamander or Brunei. Salamander's residual `τ` precision
+  gap (3.7%) was already CCD-grid discretization, not the Laplace expansion.
+
+What this **doesn't** fix (and why):
+- **Brunei**'s τ → ∞ drift in `log π̂(θ|y)` is several nats deep. The leading
+  Edgeworth correction adds ~0.4 at θ=1.88 and ~0.001 at θ=10 — too small to
+  flip my Laplace's 5-nat preference for τ → ∞. The pathology is structurally
+  beyond the leading expansion: the joint Gaussian Laplace at the constrained
+  mode misses the per-coordinate non-Gaussianity that R-INLA captures with
+  its `strategy="laplace"` (running a full Laplace at each x_i marginal).
+  Implementing that is real work — promoted again, this time to whatever the
+  next "Phase 6 — full Laplace" lane will be.
+
 ### Phase 4 — simplified-Laplace marginal-mean correction  ✅ landed (Salamander)
 
 What landed:

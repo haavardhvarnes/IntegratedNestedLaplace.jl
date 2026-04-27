@@ -140,20 +140,31 @@ function eta_derivatives(::PoissonLikelihood, y, _theta_y)
     return grad_eta, hess_eta_diag
 end
 
-# --- Third derivative of log p(y_k|η_k) wrt η_k, evaluated at η. ---
+# --- Higher derivatives of log p(y_k|η_k) wrt η_k, evaluated at η. ---
 #
-# Used by the simplified-Laplace marginal-mean correction. Returns a vector of
-# length `n_obs`. For Gaussian the third derivative is identically zero, so
-# the SLA correction is also zero — Gaussian Laplace is already exact.
+# Used by both the simplified-Laplace marginal-mean correction (3rd derivative)
+# and the Edgeworth-style correction to log π̂(y|θ) (3rd + 4th derivatives).
+# For Gaussian both are identically zero — the Laplace approximation is exact.
 
 third_deriv_eta(::GaussianLikelihood, eta, _theta_y) = zeros(eltype(eta), length(eta))
+fourth_deriv_eta(::GaussianLikelihood, eta, _theta_y) = zeros(eltype(eta), length(eta))
 
 function third_deriv_eta(::BernoulliLikelihood, eta, _theta_y)
     p = inv.(one.(eta) .+ exp.(.-eta))
     return .-p .* (one.(p) .- p) .* (one.(p) .- 2 .* p)
 end
 
+function fourth_deriv_eta(::BernoulliLikelihood, eta, _theta_y)
+    p = inv.(one.(eta) .+ exp.(.-eta))
+    pq = p .* (one.(p) .- p)            # p(1-p)
+    return .-pq .* (one.(p) .- 6 .* pq) # = -p(1-p)(1 - 6 p(1-p))
+end
+
 function third_deriv_eta(::PoissonLikelihood, eta, _theta_y)
+    return .-exp.(eta)
+end
+
+function fourth_deriv_eta(::PoissonLikelihood, eta, _theta_y)
     return .-exp.(eta)
 end
 
@@ -476,8 +487,59 @@ function inla(form::FormulaTerm, data;
             lprior += log_prior(effects[k].model, eff_slices[k])
         end
 
+        # Edgeworth-style correction to log π̂(y|θ). The Gaussian Laplace
+        # approximation rests on the second-order Taylor of `log p(y|x)` at x*;
+        # the next-order remainder picks up cubic and quartic terms in the
+        # latent deviation. To leading order:
+        #     correction = -⅛ ∑_k h⁽⁴⁾_k σ²²_k
+        #                  + ⅛ ∑_{k,l} h⁽³⁾_k h⁽³⁾_l σ²_k σ²_l Σ_(k,l)
+        #                  + ¹⁄₁₂ ∑_{k,l} h⁽³⁾_k h⁽³⁾_l Σ³_(k,l)
+        # Where Σ_(k,l) = (A H⁻¹ A')_(k,l) is the marginal η-covariance under
+        # the Gaussian Laplace, computed on the constrained subspace if
+        # `has_constraints`. Adds to `obj_main` (raises log-density).
+        # For Gaussian likelihoods the third and fourth derivatives are zero,
+        # so the correction vanishes — Gaussian Laplace is exact.
+        edgeworth_correction = _edgeworth_correction(family, A_total, F_H,
+                                                    eta_star, theta_y,
+                                                    has_constraints ? A_constraint : nothing)
+        obj_main += edgeworth_correction
+
         obj = -(obj_main + lprior)
         return obj, x_star, F_H
+    end
+
+    """
+    Leading Edgeworth correction to `log π̂(y|θ)` for non-Gaussian likelihoods.
+    Returns a Float64; for Gaussian likelihoods returns zero. Returns 0 if any
+    intermediate quantity is non-finite (numerically degenerate near constraint
+    boundaries for very large τ).
+    """
+    function _edgeworth_correction(family, A_total, F_H, eta_star, theta_y, A_c)
+        family isa GaussianLikelihood && return 0.0
+        try
+            AT = sparse(A_total')
+            Z  = F_H \ Matrix(AT)
+            Σ_eta = A_total * Z
+            if A_c !== nothing && size(A_c, 1) > 0
+                Wc = F_H \ Matrix(sparse(A_c'))
+                AHcAcT = A_total * Wc
+                S = Symmetric(Matrix(A_c * Wc))
+                AcHcAcT_inv = inv(S)
+                Σ_eta -= AHcAcT * AcHcAcT_inv * AHcAcT'
+            end
+            σ2_eta = diag(Σ_eta)
+            h3 = third_deriv_eta(family, eta_star, theta_y)
+            h4 = fourth_deriv_eta(family, eta_star, theta_y)
+            c_h4   = -0.125 * sum(h4 .* σ2_eta.^2)
+            h3h3   = h3 * h3'
+            σ2σ2   = σ2_eta * σ2_eta'
+            c_h3a  =  0.125 * sum(h3h3 .* σ2σ2 .* Σ_eta)
+            c_h3b  = (1/12) * sum(h3h3 .* (Σ_eta .^ 3))
+            c = c_h4 + c_h3a + c_h3b
+            return isfinite(c) ? c : 0.0
+        catch
+            return 0.0
+        end
     end
 
     laplace_obj(theta) = first(laplace_eval(theta))
