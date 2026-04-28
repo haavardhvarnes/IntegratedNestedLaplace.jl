@@ -25,6 +25,26 @@ Three sub-packages plus a thin user-facing API:
 
 ## Installation
 
+`IntegratedNestedLaplace.jl` and its three subpackages (`INLACore`,
+`INLAModels`, `INLASpatial`) are published in the
+[JuliaRegistry](https://github.com/haavardhvarnes/JuliaRegistry) private
+registry. Add it once per Julia installation, then `Pkg.add` works as
+usual:
+
+```julia
+using Pkg
+pkg"registry add https://github.com/haavardhvarnes/JuliaRegistry.git"
+Pkg.add("IntegratedNestedLaplace")
+```
+
+That's it — the three subpackages are pulled in automatically as
+dependencies. The General registry is also required (it ships with
+Julia by default).
+
+### Developing from a local clone
+
+If you want to hack on the package or its subpackages directly:
+
 ```julia
 using Pkg
 Pkg.activate(".")
