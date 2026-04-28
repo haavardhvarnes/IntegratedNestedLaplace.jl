@@ -44,7 +44,8 @@ cat(sprintf("inla wall (warm)    = %.4f s\n", fit$wall))
 cat(sprintf("inla cpu.used Total = %.4f s\n", as.numeric(fit$res$cpu.used["Total"])))
 
 named_summary <- function(s) {
-  cols <- c("mean", "sd", "0.025quant", "0.5quant", "0.975quant")
+  cols <- intersect(c("mean", "sd", "0.025quant", "0.5quant", "0.975quant", "mode"),
+                    colnames(s))
   out <- list()
   for (i in seq_len(nrow(s))) {
     out[[rownames(s)[i]]] <- as.list(s[i, cols, drop = TRUE])

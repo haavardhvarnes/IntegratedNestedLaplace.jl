@@ -189,6 +189,19 @@ function log_likelihood_total(::PoissonLikelihood, y, eta, _theta_y)
     return sum(y .* eta .- exp.(eta))
 end
 
+# --- Per-observation log p(y_i | η_i, θ_y), needed for the Taylor-at-zero
+# marginal-likelihood formula (Phase 6g). The existing
+# `log_likelihood_total` returns the *sum* over observations and drops
+# y-only constants (e.g. the Poisson `log y_i!`). The per-i version below
+# uses the same convention (no `log y_i!` for Poisson, no `log binom(n,y)`
+# for binomial Bernoulli) so absolute values match `log_likelihood_total`
+# but per-coordinate; only relative behaviour matters for BFGS.
+log_pdf_per_obs(::GaussianLikelihood, y, eta, theta_y) = let τ = exp(theta_y[1])
+    @. -0.5 * log(2π) + 0.5 * log(τ) - 0.5 * τ * (y - eta)^2
+end
+log_pdf_per_obs(::BernoulliLikelihood, y, eta, _theta_y) = @. y * eta - log1pexp(eta)
+log_pdf_per_obs(::PoissonLikelihood, y, eta, _theta_y)   = @. y * eta - exp(eta)
+
 # --- Latent term parsing helpers ---
 
 struct LatentEffect{M}
@@ -370,6 +383,34 @@ function inla(form::FormulaTerm, data;
     A_constraint = isempty(constraint_blocks) ?
         spzeros(Float64, 0, n_latent) :
         vcat(constraint_blocks...)
+    has_intrinsic_constraint = size(A_constraint, 1) > 0
+
+    # 4a-bis. Improper-prior detection. With `fixed_precision == 0` the
+    # intercept prior is improper. Combined with an intrinsic random effect,
+    # the prior `Q` has nullity 2: the intrinsic null (covered by the user
+    # constraint A_c) plus `e_β` (improper intercept).
+    #
+    # Phase 6c.2.b approach (now superseded): augment A_c with `e_intercept`
+    # to make Newton's H factor full rank, and use Rue-Held augmented log-
+    # determinants on `A_full = [A_c; e_intercept']`. This pinned `β = 0`,
+    # which gave H factorability but also drove BFGS to the τ → ∞ corner
+    # via an unintended τ-shape effect (Phase 6f).
+    #
+    # Phase 6g approach (current): Newton uses A_user only (no e_intercept).
+    # `gmrf_newton_full` factors `H + A_user' A_user` via `factor_augmented =
+    # true`; this is full rank because the unidentifiable direction
+    # `v = e_β − 1_u` has `A_user · v = -√n ≠ 0`, so the augmentation
+    # contributes positive curvature in the v direction. The marginal-
+    # likelihood formula (in `laplace_eval` below) switches to R-INLA's
+    # "evaluate at sample = 0" expression: `Σ aᵢ + ½ log|Q_c|_pseudo
+    # − ½ log|H_c|_user + ½ μ' H μ`. The e_intercept augmentation is
+    # used *only* internally for `½ log_pseudo|Q|_c` (Q has 2 null
+    # directions, so we need both augmentations to make Q PD before
+    # Cholesky).
+    has_intercept_col = n_fixed >= 1 && all(==(1.0), @view X[:, 1])
+    improper_augmented = fixed_precision == 0 &&
+                         has_intercept_col &&
+                         has_intrinsic_constraint
     has_constraints = size(A_constraint, 1) > 0
 
     # 4b. Validate / normalize the offset.
@@ -412,7 +453,12 @@ function inla(form::FormulaTerm, data;
     # 7. Build Q for the joint latent at given θ. The fixed-effect block has a
     # weak Gaussian prior that doesn't depend on θ. Phase 1 keeps everything in
     # Float64; AD-friendly element types come in Phase 2.
-    Q_fixed = sparse(fixed_precision * I, n_fixed, n_fixed)
+    # `fixed_precision == 0` ⇒ improper fixed-effect prior; combined with an
+    # intrinsic random effect, the augmentation block above pins the
+    # unidentifiable direction.
+    Q_fixed = fixed_precision == 0 ?
+        spzeros(Float64, n_fixed, n_fixed) :
+        sparse(fixed_precision * I, n_fixed, n_fixed)
 
     function build_Q(theta::AbstractVector)
         _, eff_slices = _slices(theta)
@@ -456,7 +502,8 @@ function inla(form::FormulaTerm, data;
         end
         x_star = try
             gmrf_newton_full(grad_eta_offset, hess_eta_offset, A_total, Q, x_warm;
-                             constraint_A = has_constraints ? A_constraint : nothing)
+                             constraint_A = has_constraints ? A_constraint : nothing,
+                             factor_augmented = improper_augmented)
         catch err
             err isa PosDefException || rethrow()
             return (bad_theta_penalty, copy(x_warm),
@@ -469,45 +516,96 @@ function inla(form::FormulaTerm, data;
 
         h_eta = hess_eta_diag_raw(eta_star)
         H = Q + sparse(A_total' * spdiagm(0 => -h_eta) * A_total)
+        # In the improper-augmented case `H` is rank-deficient along
+        # `v = e_β − 1_u` (the unidentifiable direction; v ∉ ker(A_user)
+        # since `A_user · v = -√n ≠ 0`). Factoring `H + A_user' A_user`
+        # is positive-definite — the augmentation contributes positive
+        # curvature exactly in the v direction. The same factor is reused
+        # below for `log|H_c|_user` (textbook PLUS) and for sampling in
+        # the IS correction.
+        H_factor_target = improper_augmented ?
+            (H + sparse(A_constraint') * A_constraint) : H
         F_H = try
-            cholesky(Symmetric(H))
+            cholesky(Symmetric(H_factor_target))
         catch err
             err isa PosDefException || rethrow()
             return (bad_theta_penalty, x_star,
                     cholesky(Symmetric(sparse(I * 1.0, n_latent, n_latent))))
         end
-        log_det_H = logdet(F_H)   # = log|H|, see sparse_logdet docstring
+        # `log_det_H_factor` always corresponds to the matrix the Cholesky
+        # factor `F_H` was built on. For the proper branch it equals `log|H|`;
+        # for the improper-augmented branch it equals `log|H + A_user' A_user|`.
+        log_det_H_factor = logdet(F_H)
 
-        # Constrained-determinant corrections. The Laplace approximation lives
-        # on the constrained subspace `{x : A_c x = 0}`. The right log-det
-        # formula depends on whether the matrix is rank-deficient along
-        # row(A_c):
-        #   * For `Q` (intrinsic GMRF — Besag/RW1/etc — has row(A_c) in its
-        #     null space): use the Rue & Held 2005 eq. 2.30 augmented form
-        #     `log|Q_c| = log|Q + A_c' A_c|`. The standard
-        #     `log|Q| − log(A_c Q⁻¹ A_c')` form is undefined (Q is singular).
-        #   * For `H = Q + Aᵀ D A` (full rank thanks to the data term): use
-        #     the textbook form `log|H_c| = log|H| + log(A_c H⁻¹ A_c')`. The
-        #     PLUS sign is required: at H = diag(2,3), A=(1,0), the true
-        #     conditional precision in the e_2 direction is 3 = log|H| +
-        #     log|A H⁻¹ A'| = log 6 + log(1/2). Phase 6a's MINUS form was
-        #     a sign error introduced when switching away from the augmented
-        #     form. R-INLA's `problem-setup.c::1048–1049` confirms PLUS via
-        #     `[x|Ax] = [x][Ax|x]/[Ax]` decomposition.
+        # Constrained-determinant corrections. Three branches:
+        #
+        # * proper-prior + intrinsic constraint (`has_constraints` w/o
+        #   improper_augmented): use textbook PLUS on `A_user`.
+        #   `log|H_c| = log|H| + log(A_user H⁻¹ A_user')`. R-INLA's
+        #   `problem-setup.c::1048–1049` confirms PLUS via the
+        #   `[x|Ax] = [x][Ax|x]/[Ax]` decomposition.
+        # * improper-augmented (Phase 6g): use R-INLA's "evaluate at
+        #   sample = 0" formulation — `Σ aᵢ + ½ log_pseudo|Q|_c
+        #   − ½ log|H_c|_user + ½ μ' H μ`. Here `log|H_c|_user` is via
+        #   the textbook PLUS form on `A_user` using the augmented
+        #   Cholesky `H + A_user' A_user`, and `½ log_pseudo|Q|_c` is
+        #   via the Rue-Held augmented form `log|Q + A_full' A_full|`
+        #   (Q has 2 null directions: besag/intrinsic + improper β;
+        #   `A_full = [A_user; e_intercept']` covers both).
+        # * no constraints: standard `log|Q| − log|H| + ll − ½ x'Qx`.
         obj_main = try
-            if has_constraints
+            if improper_augmented
+                # Phase 6g formula. `A_constraint = A_user` here (the
+                # e_intercept augmentation lives only inside this branch
+                # for the `½ log_pseudo|Q|_c` computation).
+                AuT = sparse(A_constraint')
+                Wc  = F_H \ Matrix(AuT)
+                S_user = Symmetric(Matrix(A_constraint * Wc))
+                log_det_H_c_user = log_det_H_factor + logdet(S_user)
+
+                # `½ log_pseudo|Q|_c` via Rue-Held augmented on A_full =
+                # [A_user; e_intercept']. The two augmentation rows cover
+                # both null directions of Q. For our orthonormal A_full
+                # the augmented Cholesky's logdet equals
+                # `log_pseudo|Q|_ker(A_full)`, which on ker(A_user)
+                # excludes the e_β null inside the constraint set.
+                e_int_row = sparse([1], [1], [1.0], 1, n_latent)
+                A_full_for_Q = vcat(A_constraint, e_int_row)
+                AfT_for_Q = sparse(A_full_for_Q')
+                log_det_Q_c_pseudo = sparse_logdet(Q + AfT_for_Q * A_full_for_Q)
+
+                # The R-INLA "evaluate at zero" terms.
+                r_m = A_total * x_star                              # predictor without offset
+                sum_a = _taylor_at_zero_loglik(family, y_raw, r_m, theta_y, o_vec)
+                quad_xHx = 0.5 * dot(x_star, H * x_star)            # ½ μ' H μ
+
+                # NOTE on cubic: R-INLA's `aa[i]` from `GMRFLib_2order_approx`
+                # actually truncates the Taylor at 2nd-order (the cubic term
+                # in their formula is gated on `dd != NULL` which is NULL in
+                # `ai_marginal_hyperparam`'s call path). Empirically (Phase 6g+
+                # Phase A) our 3rd-order Σ a_i differs from R-INLA's 2nd-order
+                # one by +cubic_correction. We *do not* subtract cubic here —
+                # subtracting it shifts the obj curve enough to expose the
+                # global min at θ → ∞, dominated by the formula's slow right-
+                # tail decay. Keeping the 3rd-order Taylor gives BFGS a
+                # well-conditioned local mode in the basin near R-INLA's mode
+                # θ ≈ 1.87 (R-INLA also converges via local BFGS, not
+                # global optimization).
+                sum_a + 0.5 * log_det_Q_c_pseudo - 0.5 * log_det_H_c_user +
+                    quad_xHx
+            elseif has_constraints
                 AcT = sparse(A_constraint')
                 Q_aug = Q + AcT * A_constraint
                 log_det_Q_c = sparse_logdet(Q_aug)
                 # log|H_c| = log|H| + log(A_c H⁻¹ A_c')   (full-rank H form)
                 Wc = F_H \ Matrix(AcT)
                 S_h = Symmetric(Matrix(A_constraint * Wc))
-                log_det_H_c = log_det_H + logdet(S_h)
+                log_det_H_c = log_det_H_factor + logdet(S_h)
                 lp_correct = -0.5 * dot(x_star, Q * x_star) + 0.5 * log_det_Q_c
                 ll + lp_correct - 0.5 * log_det_H_c
             else
                 lp = -0.5 * dot(x_star, Q * x_star) + 0.5 * sparse_logdet(Q)
-                ll + lp - 0.5 * log_det_H
+                ll + lp - 0.5 * log_det_H_factor
             end
         catch err
             err isa PosDefException || rethrow()
@@ -531,12 +629,20 @@ function inla(form::FormulaTerm, data;
         # `δ = F.UP \ z` and projected onto the constraint set.  Bernoulli
         # has `R = O(δ³)`; Poisson has `R = O(δ³)` too. For Gaussian
         # likelihoods R ≡ 0 — Laplace is exact and we skip the correction.
-        # Cost: `N` triangular solves + `N` likelihood evaluations per call.
-        is_correction = _importance_correction(family, A_total, F_H,
-                                               x_star, eta_star, theta_y,
-                                               y_raw, o_vec,
-                                               has_constraints ? A_constraint : nothing)
-        obj_main += is_correction
+        #
+        # In the improper-augmented branch the IS correction is *not*
+        # added: the new "evaluate at sample = 0" formulation uses a
+        # 3rd-order Taylor of the log-likelihood and the IS correction
+        # would double-count the same Taylor remainder. The cubic
+        # correction (Phase 6g.3) is the leading term; higher-order
+        # corrections are deferred until parity tightens past 0.01 nats.
+        if !improper_augmented
+            is_correction = _importance_correction(family, A_total, F_H,
+                                                   x_star, eta_star, theta_y,
+                                                   y_raw, o_vec,
+                                                   has_constraints ? A_constraint : nothing)
+            obj_main += is_correction
+        end
 
         obj = -(obj_main + lprior)
         return obj, x_star, F_H
@@ -673,8 +779,29 @@ function inla(form::FormulaTerm, data;
     end
     H_theta = Symmetric(H_theta + 1e-9 * I)
 
-    # Generate CCD nodes around θ* in θ-space.
-    nodes = integration_nodes(theta_star, Matrix(H_theta))
+    # Asymmetric skewness corrections per principal axis (R-INLA's
+    # `stdev_corr_pos` / `stdev_corr_neg`, gmrflib/approx-inference.c:1736–1834).
+    # Probe `laplace_obj` at z = ±√2 along each eigvec; if the log-posterior
+    # drops by `f0` from the mode, the local Gaussian would predict
+    # `f0 = step² / 2 = 1`. The correction is `sqrt(step²/(2·f0))`, which
+    # widens the grid where the posterior is fatter than Gaussian and
+    # narrows it where it's tighter. Without this, heavy-tailed precision
+    # posteriors (e.g. Brunei's right tail of τ) under-sample the right side.
+    stdev_corr_pos, stdev_corr_neg = _compute_skew_corrections(laplace_obj,
+                                                               theta_star,
+                                                               Matrix(H_theta);
+                                                               step = sqrt(2.0))
+
+    # Generate integration nodes around θ* in θ-space. For `n_h ∈ {1, 2}`
+    # this returns R-INLA's `int.strategy = "grid"` design (11 points spanning
+    # ±3.5σ for 1D, 45 points for 2D) along with quadrature weights that
+    # compensate for the non-uniform spacing; for `n_h ≥ 3` it falls back to
+    # CCD with equal weights. The downstream Bayesian-quadrature combination
+    # is `posterior ∝ exp(-obj_node) × quad_weight`, so the weights enter the
+    # softmax additively in log-space (see below).
+    nodes, quad_w = integration_nodes(theta_star, Matrix(H_theta);
+                                      stdev_corr_pos = stdev_corr_pos,
+                                      stdev_corr_neg = stdev_corr_neg)
 
     # Evaluate the posterior at each node, store (x_k, var_k, obj_k).
     # Also apply the simplified-Laplace marginal-mean correction for x:
@@ -736,7 +863,7 @@ function inla(form::FormulaTerm, data;
                           hcat(theta_star, fill(NaN, n_h)),
                           [collect(theta_star)], [1.0], form)
     end
-    log_w = -(obj_at .- minimum(finite_objs))
+    log_w = -(obj_at .- minimum(finite_objs)) .+ log.(quad_w)
     log_w[.!isfinite.(log_w)] .= -Inf
     log_w_max = maximum(filter(isfinite, log_w))
     w = exp.(log_w .- log_w_max)
@@ -771,6 +898,52 @@ function inla(form::FormulaTerm, data;
 end
 
 """
+    _compute_skew_corrections(obj, theta_star, hessian; step = √2)
+
+R-INLA-style asymmetric skewness corrections per principal axis
+(`gmrflib/approx-inference.c:1736–1834`). Probe `obj` at
+`theta_star + step · evec_k · sqrt(1/eval_k) · sign` for each eigenvector
+`k` and each `sign ∈ {+1, -1}`. Compute the drop in log-posterior
+`f0 = obj(probe) − obj(mode)`. If the posterior were Gaussian at the
+mode, `f0 = step² / 2`. The correction is
+`sqrt(step² / (2·f0))` — > 1 when the posterior is fatter than Gaussian
+on that side, < 1 when tighter. Returns `(pos, neg)` vectors of length
+`n_h` (each defaulting to 1.0 if the probe lands in a non-finite
+region).
+"""
+function _compute_skew_corrections(obj, theta_star::AbstractVector{T},
+                                   hessian::AbstractMatrix{T};
+                                   step::T = T(sqrt(2.0))) where {T}
+    n = length(theta_star)
+    n == 0 && return (T[], T[])
+
+    evals, evecs = eigen(Symmetric(hessian))
+    evals_safe = max.(evals, T(1e-9))
+    sd_inv = sqrt.(one(T) ./ evals_safe)
+
+    obj_mode = obj(theta_star)
+    isfinite(obj_mode) || return (ones(T, n), ones(T, n))
+
+    pos = ones(T, n)
+    neg = ones(T, n)
+    z = zeros(T, n)
+    for k in 1:n
+        # Probe along +z[k]: θ = θ_star + evecs · diag(sd_inv) · (step·e_k)
+        fill!(z, zero(T)); z[k] = step
+        delta = evecs * (sd_inv .* z)
+        f0 = obj(theta_star .+ delta) - obj_mode
+        pos[k] = (isfinite(f0) && f0 > 0) ? sqrt(step^2 / (2 * f0)) : one(T)
+
+        # Probe along -z[k]
+        fill!(z, zero(T)); z[k] = -step
+        delta = evecs * (sd_inv .* z)
+        f0 = obj(theta_star .+ delta) - obj_mode
+        neg[k] = (isfinite(f0) && f0 > 0) ? sqrt(step^2 / (2 * f0)) : one(T)
+    end
+    return pos, neg
+end
+
+"""
     _finitediff_hessian(f, x; eps=1e-3)
 
 Central-difference Hessian of a scalar function `f` at `x`. Used at θ* to
@@ -797,6 +970,83 @@ function _finitediff_hessian(f, x::AbstractVector{T}; eps_::T = T(1e-3)) where {
         end
     end
     return H
+end
+
+"""
+    _marginal_likelihood_cubic_correction(family, A_total, x_star, eta_star, theta_y)
+
+Cubic correction to `log p̂(y|θ)` to match R-INLA's marginal-likelihood
+formulation.
+
+R-INLA evaluates the marginal likelihood at the origin (`x = 0`) using a
+3rd-order Taylor expansion of `log p(y|η)` centered at the joint mode `η_m`
+(see `gmrflib/blockupdate.c::GMRFLib_2order_approx`). We evaluate the same
+quantity at the joint mode using the *exact* log-likelihood. Algebraically
+the two approaches differ by
+
+    R-INLA  -  Julia  =  -1/6 · Σ_i f'''_i · (η_m_i)³
+
+where `f'''_i = d³ log p(y_i|η_i)/dη³` evaluated at the linear predictor
+mode `η_m_i` (without offset — R-INLA's loglFunc API takes the predictor
+and adds the offset internally). The derivation uses the joint-mode
+condition `Q·x* = Aᵀ·grad` (which lets the linear `Σ b_i η_m_i` term cancel
+between the two formulations) and the identity `½ x*' H x* = ½ x*' Q x* +
+½ Σ c_i η_m_i²` that links R-INLA's "evaluate at x=0" trick to our
+"evaluate at x=x*" formula.
+
+For Gaussian likelihoods `f''' ≡ 0` so the correction vanishes. For Poisson
+`f''' = -λ` (= -exp(η+offset)). For Bernoulli `f''' = -p(1-p)(1-2p)`.
+
+Returns 0.0 on numerical failure.
+"""
+function _marginal_likelihood_cubic_correction(family, A_total,
+                                               x_star, eta_star, theta_y)
+    family isa GaussianLikelihood && return 0.0
+    try
+        # `eta_star = A·x* + offset`. R-INLA's `f'''` is a function of
+        # `η_full = predictor + offset`, but its Taylor is in the predictor
+        # `r = predictor` (without offset). At the mode, `r_m = A·x*` and
+        # `η_full_m = r_m + offset = eta_star`. The third-derivative value
+        # depends on `η_full_m` (e.g. Poisson `f''' = -exp(eta_star)`),
+        # but the cubic argument `η_m` in the correction formula is the
+        # predictor `r_m`, not the full η.
+        r_m = A_total * x_star
+        h3 = third_deriv_eta(family, eta_star, theta_y)
+        c = -(1 / 6) * sum(h3 .* r_m .^ 3)
+        return isfinite(c) ? c : 0.0
+    catch
+        return 0.0
+    end
+end
+
+"""
+    _taylor_at_zero_loglik(family, y, r_m, theta_y, offset)
+
+R-INLA's "evaluate at sample = 0" log-likelihood (Phase 6g formulation).
+
+For each i, compute the 3rd-order Taylor expansion of
+`ℓ_i(r) = log p(y_i | r + offset_i, θ_y)` centered at the predictor mode
+`r_m_i`, evaluated at `r = 0`:
+
+    T_i(0) = ℓ_i(r_m_i) − ℓ_i'(r_m_i) r_m_i + ½ ℓ_i''(r_m_i) r_m_i²
+             − 1/6 ℓ_i'''(r_m_i) r_m_i³
+
+Returns `Σ_i T_i(0)`.
+
+This replaces `log p(y|x*, θ)` in the marginal-likelihood formula
+(R-INLA's `gmrflib/blockupdate.c::GMRFLib_2order_approx`). For Gaussian
+likelihoods f''' ≡ 0 so the Taylor is exact and reduces to
+`log p(y|η = offset, θ_y)` (the likelihood at predictor = 0).
+"""
+function _taylor_at_zero_loglik(family, y, r_m, theta_y, offset)
+    eta_m = r_m .+ offset
+    grad_eta, hess_eta_diag = eta_derivatives(family, y, theta_y)
+    fp_at  = grad_eta(eta_m)
+    fpp_at = hess_eta_diag(eta_m)
+    fppp_at = third_deriv_eta(family, eta_m, theta_y)
+    f0_at  = log_pdf_per_obs(family, y, eta_m, theta_y)
+    return sum(@. f0_at - fp_at * r_m + 0.5 * fpp_at * r_m^2 -
+                  (1/6) * fppp_at * r_m^3)
 end
 
 """

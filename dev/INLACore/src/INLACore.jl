@@ -81,6 +81,11 @@ Inputs:
   Newton step solves the augmented KKT system to enforce `A_c · x = e_c` at
   every iteration.
 * `constraint_e` — `k`-vector of constraint targets (defaults to zeros).
+* `factor_augmented` — when `true`, the Cholesky used in the Schur step
+  factors `H + A_c' A_c` instead of `H`. Required when `H` is rank-deficient
+  along `null(H) ⊆ span(constraint_A')` (e.g. improper-prior augmentation
+  for an intrinsic GMRF + improper intercept). On `ker(constraint_A)`,
+  `H + A_c' A_c = H`, so the resulting Newton direction is unchanged.
 
 Returns the latent mode `x*` (vector). The Cholesky factor is *not* returned;
 the caller can reconstruct it cheaply at `x*`.
@@ -90,13 +95,18 @@ function gmrf_newton_full(grad_eta, hess_eta_diag,
                           x0::Vector{T};
                           constraint_A::Union{Nothing,SparseMatrixCSC{T,Int}} = nothing,
                           constraint_e::Union{Nothing,AbstractVector{T}} = nothing,
+                          factor_augmented::Bool = false,
                           max_iter::Int = 50, tol = T(1e-8)) where {T}
     x = copy(x0)
     AT = sparse(A')
     have_constraint = constraint_A !== nothing && size(constraint_A, 1) > 0
+    AcT_AcT_Ac = nothing
     if have_constraint
         e = constraint_e === nothing ? zeros(T, size(constraint_A, 1)) : collect(constraint_e)
         AcT = sparse(constraint_A')
+        if factor_augmented
+            AcT_AcT_Ac = AcT * constraint_A
+        end
         # Project initial x onto the constraint set so subsequent Newton steps
         # only need to update toward the constrained mode.
         _ = e   # used below
@@ -108,7 +118,8 @@ function gmrf_newton_full(grad_eta, hess_eta_diag,
         g = Q * x - AT * g_eta
         D = spdiagm(0 => -h_eta)
         H = Q + AT * D * A
-        F = cholesky(Symmetric(H))
+        H_factored = (have_constraint && factor_augmented) ? (H + AcT_AcT_Ac) : H
+        F = cholesky(Symmetric(H_factored))
         if have_constraint
             # Solve the augmented system
             #   [H  A_c'] [dx ] = [-g          ]
@@ -282,19 +293,146 @@ end
 
 # --- Integration ---
 
-function integration_nodes(mode::AbstractVector{T}, hessian::AbstractMatrix{T}; method=:ccd) where T
+# R-INLA's `int.strategy = "grid"` design for `nhyper == 1`. Eleven points
+# in *standardized* coordinates plus quadrature weights that compensate for
+# the non-uniform spacing. Verbatim from
+# https://github.com/hrue/r-inla/blob/devel/gmrflib/design.c lines 39–65.
+const _RINLA_GRID_X1 = [-3.5, -2.5, -1.75, -1.0, -0.5, 0.0,
+                         0.5,  1.0,  1.75,  2.5,  3.5]
+const _RINLA_GRID_W1 = [3.187537795, 1.811358205, 1.937929918,
+                        1.431919577, 1.288639321, 1.0,
+                        1.288639321, 1.431919577, 1.937929918,
+                        1.811358205, 3.187537795]
+
+# R-INLA's `int.strategy = "grid"` design for `nhyper == 2`. Forty-five
+# (x, y) standardized pairs and per-node quadrature weights. Verbatim from
+# the `x2[]` / `w2[]` tables in gmrflib/design.c lines 67–161.
+const _RINLA_GRID_X2 = [
+    -2.25 -1.25;  -2.25 -0.5;   -2.25  0.0;  -2.25  0.5;  -2.25  1.25;
+    -1.25 -2.25;  -1.25 -1.25;  -1.25 -0.5;  -1.25  0.0;  -1.25  0.5;
+    -1.25  1.25;  -1.25  2.25;
+    -0.5  -2.25;  -0.5  -1.25;  -0.5  -0.5;  -0.5   0.0;  -0.5   0.5;
+    -0.5   1.25;  -0.5   2.25;
+     0.0  -2.25;   0.0  -1.25;   0.0  -0.5;   0.0   0.0;   0.0   0.5;
+     0.0   1.25;   0.0   2.25;
+     0.5  -2.25;   0.5  -1.25;   0.5  -0.5;   0.5   0.0;   0.5   0.5;
+     0.5   1.25;   0.5   2.25;
+     1.25 -2.25;   1.25 -1.25;   1.25 -0.5;   1.25  0.0;   1.25  0.5;
+     1.25  1.25;   1.25  2.25;
+     2.25 -1.25;   2.25 -0.5;   2.25  0.0;   2.25  0.5;   2.25  1.25
+]
+const _RINLA_GRID_W2 = [
+    2.277250821, 1.248862019, 1.93160554,  1.248862019, 2.277250821,
+    2.277250821, 1.389904145, 0.762234217, 1.17894196,  0.762234217,
+    1.389904145, 2.277250821,
+    1.248862019, 0.762234217, 0.4180151587, 0.646540918, 0.4180151587,
+    0.762234217, 1.248862019,
+    1.93160554,  1.17894196,  0.646540918, 1.0,         0.646540918,
+    1.17894196,  1.93160554,
+    1.248862019, 0.762234217, 0.4180151587, 0.646540918, 0.4180151587,
+    0.762234217, 1.248862019,
+    2.277250821, 1.389904145, 0.762234217, 1.17894196,  0.762234217,
+    1.389904145, 2.277250821,
+    2.277250821, 1.248862019, 1.93160554,  1.248862019, 2.277250821
+]
+
+"""
+    integration_nodes(mode, hessian; method = :auto,
+                      stdev_corr_pos = nothing, stdev_corr_neg = nothing)
+
+Build a quadrature design for integrating a posterior on θ.
+
+`method = :auto` (default) reproduces R-INLA's selection
+(`inlaprog/src/inla.c:1365–1369`): use the fixed `int.strategy = "grid"`
+design for `n_dims ∈ {1, 2}` and CCD for `n_dims ≥ 3`. `method = :ccd`
+forces the CCD design at any dimension; `method = :grid` forces the
+fixed grid (errors for `n_dims ≥ 3`, since R-INLA only ships tables for
+1 and 2).
+
+`stdev_corr_pos` / `stdev_corr_neg` are R-INLA's per-axis asymmetric
+skewness corrections (`approx-inference.c:1736–1834`). They scale each
+standardized coordinate `z[k]` by `stdev_corr_pos[k]` when `z[k] ≥ 0`
+and by `stdev_corr_neg[k]` when `z[k] < 0`, before mapping to θ-space
+via the inverse-Hessian eigendecomp. R-INLA derives them by probing the
+log-posterior at `z = ±√2` along each principal axis and equating to
+the Gaussian drop of 1 nat. Pass `nothing` (default) for the symmetric
+Gaussian case where both corrections are 1.
+
+Returns `(nodes, quad_weights)`:
+
+* `nodes` — `Vector{Vector{T}}` of θ-space node locations, each of length
+  `n_dims`. Standardized points `z` are mapped through the inverse-Hessian
+  eigendecomp `evec · sqrt(1/eval) · z` (with optional asymmetric
+  scaling).
+* `quad_weights` — non-negative `Vector{T}` of quadrature weights, one per
+  node. For the R-INLA grid these compensate for the non-uniform node
+  spacing (so the downstream Bayesian quadrature
+  `posterior ∝ exp(-obj_at_node) × quad_weight` doesn't over-weight the
+  outer points). For the CCD path all weights are 1.0.
+"""
+function integration_nodes(mode::AbstractVector{T}, hessian::AbstractMatrix{T};
+                           method::Symbol = :auto,
+                           stdev_corr_pos::Union{Nothing,AbstractVector{<:Real}} = nothing,
+                           stdev_corr_neg::Union{Nothing,AbstractVector{<:Real}} = nothing) where T
     n_dims = length(mode)
+    method_used = method === :auto ? (n_dims <= 2 ? :grid : :ccd) :
+                  method === :grid && n_dims >= 3 ?
+                      error("`method = :grid` only available for n_dims ∈ {1, 2}; got n_dims = $n_dims") :
+                  method
+
+    # Build the (eigvec · diag(1/√eigval)) basis once. For n_dims == 1 this
+    # collapses to a scalar `sd`.
     if n_dims == 1
-        sd = one(T) / sqrt(hessian[1,1])
-        return [mode, mode .+ T(1.5)*sd, mode .- T(1.5)*sd]
+        sd = one(T) / sqrt(hessian[1, 1])
+        z_pts = method_used === :grid ? _RINLA_GRID_X1 : nothing
+        z_pts === nothing && (z_pts = vec(T.(ccdesign(n_dims))))
     end
-    z_points = T.(ccdesign(n_dims))
-    evals, evecs = eigen(Symmetric(hessian))
-    evals = max.(evals, T(1e-9))
-    trans = evecs * diagm(one(T) ./ sqrt.(evals))
-    n_nodes = size(z_points, 1)
-    nodes = [mode + trans * z_points[i, :] for i in 1:n_nodes]
-    return nodes
+
+    if method_used === :grid && n_dims == 1
+        nodes = [mode .+ _scale_z(T(x), 1, stdev_corr_pos, stdev_corr_neg) * sd
+                 for x in _RINLA_GRID_X1]
+        weights = T.(_RINLA_GRID_W1)
+        return nodes, weights
+    elseif method_used === :grid && n_dims == 2
+        evals, evecs = eigen(Symmetric(hessian))
+        evals = max.(evals, T(1e-9))
+        trans = evecs * diagm(one(T) ./ sqrt.(evals))
+        nodes = [mode .+ trans * _scale_z_vec(T.(_RINLA_GRID_X2[k, :]),
+                                              stdev_corr_pos, stdev_corr_neg)
+                 for k in axes(_RINLA_GRID_X2, 1)]
+        weights = T.(_RINLA_GRID_W2)
+        return nodes, weights
+    else
+        z_points = T.(ccdesign(n_dims))
+        evals, evecs = eigen(Symmetric(hessian))
+        evals = max.(evals, T(1e-9))
+        trans = evecs * diagm(one(T) ./ sqrt.(evals))
+        n_nodes = size(z_points, 1)
+        nodes = [mode + trans * _scale_z_vec(z_points[i, :], stdev_corr_pos, stdev_corr_neg)
+                 for i in 1:n_nodes]
+        weights = ones(T, n_nodes)
+        return nodes, weights
+    end
+end
+
+# Scale a single standardized coordinate by the asymmetric skewness correction.
+@inline function _scale_z(z::T, k::Int,
+                          pos::Union{Nothing,AbstractVector{<:Real}},
+                          neg::Union{Nothing,AbstractVector{<:Real}}) where {T<:Real}
+    pos === nothing && return z
+    return z >= zero(T) ? z * T(pos[k]) : z * T(neg[k])
+end
+
+# Apply per-axis asymmetric skew correction to a standardized z-vector.
+function _scale_z_vec(z::AbstractVector{T},
+                      pos::Union{Nothing,AbstractVector{<:Real}},
+                      neg::Union{Nothing,AbstractVector{<:Real}}) where {T<:Real}
+    pos === nothing && neg === nothing && return z
+    out = similar(z)
+    @inbounds for k in eachindex(z)
+        out[k] = _scale_z(z[k], k, pos, neg)
+    end
+    return out
 end
 
 function find_mode(f, x0, p=nothing; solver=Newton(), adtype=Optimization.AutoForwardDiff(), kwargs...)
